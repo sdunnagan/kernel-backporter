@@ -1,0 +1,1356 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""Dependency-aware Linux kernel backport orchestrator for RPM-oriented trees.
+
+kernel-backporter preserves the useful workflow of the original
+centos-kernel-backporter script, but preflights a requested upstream commit in
+an isolated clone before touching the user's working tree.
+
+The central safety invariant is deliberately strict:
+
+    The tool may add known upstream prerequisite commits, but it never edits a
+    conflicted source file automatically.
+
+When a cherry-pick fails, the orchestrator uses upstream hunk provenance,
+Fixes: relationships, downstream provenance, and upstream history to look for
+missing prerequisite commits.  It retries only by adding ordinary upstream
+commits.  If that cannot make the sequence apply cleanly, it stops and writes
+an inspection dossier.
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import dataclasses
+import datetime as dt
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+from pathlib import Path
+from typing import Iterable, Iterator, Sequence
+
+
+VERSION = "0.1.1"
+
+
+HEX40 = r"[0-9a-fA-F]{40}"
+CHERRY_PICK_RE = re.compile(rf"(?im)^\s*\(cherry picked from commit ({HEX40})\)\s*$")
+UPSTREAM_COMMIT_RE = re.compile(rf"(?im)^\s*Upstream commit\s+({HEX40})\b")
+STABLE_UPSTREAM_RE = re.compile(rf"(?im)^\s*commit\s+({HEX40})\s+upstream\.?\s*$")
+EMBEDDED_COMMIT_RE = re.compile(rf"(?im)^\s*commit\s+({HEX40})\s*$")
+FIXES_RE = re.compile(r"(?im)^Fixes:\s*([0-9a-f]{7,40})\b")
+LINK_RE = re.compile(r"(?im)^Link:\s*(https?://\S+)")
+LORE_MSGID_RE = re.compile(r"https?://lore\.kernel\.org/[^/]+/(?:r/)?([^/\s>]+)")
+SERIES_MSGID_RE = re.compile(r"^(?P<stem>.+)-(?P<num>\d+)-(?P<tail>[^@]+@.+)$")
+DIFF_FILE_RE = re.compile(r"^diff --git a/(.+?) b/(.+)$")
+HUNK_RE = re.compile(r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@")
+FUNC_CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+MACRO_RE = re.compile(r"\b([A-Z][A-Z0-9_]{3,})\b")
+BUILD_SYMBOL_RES = [
+    re.compile(r"implicit declaration of function [‘'`](?P<sym>[A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"undefined reference to [‘'`](?P<sym>[A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"[‘'`](?P<sym>[A-Za-z_][A-Za-z0-9_]*)[’'`] undeclared"),
+]
+
+C_KEYWORDS = {
+    "if", "for", "while", "switch", "return", "sizeof", "typeof",
+    "__typeof__", "defined", "case", "do", "else",
+}
+IGNORE_SYMBOLS = {
+    "WARN_ON", "WARN_ON_ONCE", "BUG_ON", "IS_ENABLED", "ARRAY_SIZE",
+    "BIT", "GENMASK", "READ_ONCE", "WRITE_ONCE", "likely", "unlikely",
+}
+
+
+class KBError(RuntimeError):
+    pass
+
+
+class Git:
+    def __init__(self, cwd: Path, debug: bool = False):
+        self.cwd = cwd
+        self.debug = debug
+
+    def _run_cp(
+        self,
+        args: Sequence[str],
+        *,
+        check: bool = True,
+        input_text: str | None = None,
+        cwd: Path | None = None,
+        stdout=None,
+        stderr=None,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess:
+        cmd = ["git", *args]
+        if self.debug:
+            print("+", shlex.join(cmd), file=sys.stderr)
+        cp = subprocess.run(
+            cmd,
+            cwd=str(cwd or self.cwd),
+            input=input_text,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE if stdout is None else stdout,
+            stderr=subprocess.PIPE if stderr is None else stderr,
+            env=env,
+        )
+        if check and cp.returncode:
+            serr = cp.stderr if isinstance(cp.stderr, str) else ""
+            raise KBError(
+                f"command failed ({cp.returncode}): {shlex.join(cmd)}\n{serr.strip()}"
+            )
+        return cp
+
+    def run(
+        self,
+        args: Sequence[str],
+        *,
+        check: bool = True,
+        input_text: str | None = None,
+        cwd: Path | None = None,
+        env: dict[str, str] | None = None,
+    ) -> str:
+        return self._run_cp(
+            args, check=check, input_text=input_text, cwd=cwd, env=env
+        ).stdout
+
+    def ok(self, args: Sequence[str], *, cwd: Path | None = None) -> bool:
+        cp = subprocess.run(
+            ["git", *args], cwd=str(cwd or self.cwd),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return cp.returncode == 0
+
+    def rev_parse(self, obj: str) -> str:
+        return self.run(["rev-parse", "--verify", f"{obj}^{{commit}}"]).strip()
+
+    def subject(self, sha: str) -> str:
+        return self.run(["show", "-s", "--format=%s", sha]).strip()
+
+    def body(self, sha: str) -> str:
+        return self.run(["show", "-s", "--format=%B", sha])
+
+    def medium_header(self, sha: str) -> str:
+        return self.run(["show", "--no-patch", "--format=medium", sha]).rstrip()
+
+    def parents(self, sha: str) -> list[str]:
+        return self.run(["show", "-s", "--format=%P", sha]).strip().split()
+
+    def changed_files(self, sha: str) -> list[str]:
+        return [x for x in self.run([
+            "diff-tree", "--no-commit-id", "--name-only", "-r", sha
+        ]).splitlines() if x]
+
+    def is_ancestor(self, older: str, newer: str) -> bool:
+        return self.ok(["merge-base", "--is-ancestor", older, newer])
+
+    def remotes(self) -> set[str]:
+        return {x.strip() for x in self.run(["remote"]).splitlines() if x.strip()}
+
+    def remote_url(self, remote: str) -> str | None:
+        if remote not in self.remotes():
+            return None
+        out = self.run(["remote", "get-url", remote], check=False).strip()
+        return out or None
+
+    def status_clean(self) -> bool:
+        return not self.run(["status", "--porcelain=v1"]).strip()
+
+
+@dataclasses.dataclass
+class IdentityMatch:
+    present: bool = False
+    downstream_sha: str | None = None
+    method: str | None = None
+    source: str | None = None  # working-tree | current-downstream
+    confidence: str | None = None
+
+
+@dataclasses.dataclass
+class ConflictInfo:
+    sha: str
+    files: list[str]
+    stdout: str = ""
+    stderr: str = ""
+
+
+@dataclasses.dataclass
+class DependencyCandidate:
+    sha: str
+    score: int
+    reasons: list[str]
+    files: list[str]
+
+
+@dataclasses.dataclass
+class SequenceResult:
+    clean: bool
+    applied: list[str]
+    conflict: ConflictInfo | None = None
+    check_rc: int | None = None
+    check_output: str | None = None
+
+
+@dataclasses.dataclass
+class SeriesPeer:
+    sha: str
+    subject: str
+    patch_number: int | None
+    status: str
+    downstream_sha: str | None
+    method: str | None
+
+
+class ProvenanceIndex:
+    """Map upstream identities to commits in one downstream history."""
+
+    def __init__(self, git: Git, ref: str, label: str, debug: bool = False):
+        self.git = git
+        self.ref = ref
+        self.label = label
+        self.debug = debug
+        self.exact: set[str] = set()
+        self.refs: dict[str, tuple[str, str]] = {}
+        self._build()
+
+    def _index_record(self, sha: str, body: str) -> None:
+        sha = sha.strip().lower()
+        if not sha:
+            return
+        self.exact.add(sha)
+        for regex, label in (
+            (CHERRY_PICK_RE, "cherry-picked-from"),
+            (UPSTREAM_COMMIT_RE, "upstream-commit"),
+            (STABLE_UPSTREAM_RE, "stable-upstream"),
+        ):
+            for upstream_sha in regex.findall(body):
+                self.refs.setdefault(upstream_sha.lower(), (sha, label))
+        # RHEL backports often preserve an indented/default git-show header
+        # containing a standalone "commit <upstream sha>" line.
+        for upstream_sha in EMBEDDED_COMMIT_RE.findall(body):
+            self.refs.setdefault(upstream_sha.lower(), (sha, "embedded-commit"))
+
+    def _build(self) -> None:
+        # Do not collect the entire downstream history in one Python string.
+        # Kernel commit bodies can make that hundreds of MB, and split("\0")
+        # temporarily duplicates much of it. Stream NUL-delimited SHA/body pairs
+        # instead so memory use stays bounded by roughly one chunk/commit body.
+        cmd = [
+            "git", "log", "--no-merges", "--format=%H%x00%B%x00", self.ref
+        ]
+        proc = subprocess.Popen(
+            cmd, cwd=str(self.git.cwd), stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, encoding="utf-8",
+            errors="surrogateescape",
+        )
+        assert proc.stdout is not None
+
+        pending = ""
+        fields: list[str] = []
+        count = 0
+        while True:
+            chunk = proc.stdout.read(65536)
+            if not chunk:
+                break
+            pending += chunk
+            parts = pending.split("\0")
+            pending = parts.pop()
+            for field in parts:
+                fields.append(field)
+                if len(fields) == 2:
+                    self._index_record(fields[0], fields[1])
+                    count += 1
+                    fields.clear()
+
+        proc.stdout.close()
+        stderr = proc.stderr.read() if proc.stderr else ""
+        rc = proc.wait()
+        if rc:
+            raise KBError(
+                f"failed to index downstream provenance for {self.label}: "
+                f"{stderr.strip()}"
+            )
+        if fields or pending.strip():
+            raise KBError(
+                f"malformed git log stream while indexing downstream provenance "
+                f"for {self.label}"
+            )
+        print(f"  indexed {count} non-merge commits from {self.label}")
+
+    def match_aliases(self, aliases: Iterable[str]) -> IdentityMatch:
+        for alias in aliases:
+            alias = alias.lower()
+            if alias in self.exact:
+                return IdentityMatch(True, alias, "exact-sha", self.label, "high")
+            if alias in self.refs:
+                ds, method = self.refs[alias]
+                conf = "high" if method != "embedded-commit" else "medium-high"
+                return IdentityMatch(True, ds, method, self.label, conf)
+        return IdentityMatch()
+
+
+class ReferenceManager:
+    OFFICIAL_STABLE = "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git"
+    OFFICIAL_NEXT = "https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git"
+
+    def __init__(self, args: argparse.Namespace, work_git: Git):
+        self.args = args
+        self.work_git = work_git
+        self.root = Path(args.reference_root).expanduser().resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.upstream_path = self.root / ("linux-stable" if args.linux_repo == "stable" else "linux-next")
+        self.downstream_path = self.root / "cs10"
+
+    def _discover_upstream_url(self) -> str:
+        if self.args.upstream_url:
+            return self.args.upstream_url
+        remote = "linux-stable" if self.args.linux_repo == "stable" else "linux-next"
+        return self.work_git.remote_url(remote) or (
+            self.OFFICIAL_STABLE if self.args.linux_repo == "stable" else self.OFFICIAL_NEXT
+        )
+
+    def _discover_downstream_url(self) -> str:
+        if self.args.downstream_url:
+            return self.args.downstream_url
+        candidates = [self.args.downstream_remote, "cs10", "origin"]
+        for remote in dict.fromkeys(x for x in candidates if x):
+            url = self.work_git.remote_url(remote)
+            if url:
+                return url
+        raise KBError(
+            "cannot determine downstream repository URL; pass --downstream-url "
+            "or configure a cs10/origin remote"
+        )
+
+    def _clone_if_missing(self, path: Path, url: str, label: str) -> None:
+        if (path / ".git").exists():
+            return
+        if path.exists() and any(path.iterdir()):
+            raise KBError(f"reference path exists but is not a git clone: {path}")
+        print(f"Creating {label} reference repository: {path}")
+        cp = subprocess.run(["git", "clone", url, str(path)], text=True)
+        if cp.returncode:
+            raise KBError(f"failed to clone {label} reference from {url}")
+
+    def prepare(self) -> tuple[Git, Git, str, str]:
+        upstream_url = self._discover_upstream_url()
+        downstream_url = self._discover_downstream_url()
+        self._clone_if_missing(self.upstream_path, upstream_url, "upstream")
+        self._clone_if_missing(self.downstream_path, downstream_url, "downstream")
+
+        ug = Git(self.upstream_path, self.args.debug)
+        dg = Git(self.downstream_path, self.args.debug)
+
+        if not self.args.skip_refresh:
+            print(f"Refreshing upstream reference:   {self.upstream_path}")
+            ug.run(["fetch", "--prune", "--tags", "origin"])
+            print(f"Refreshing current CS10 reference: {self.downstream_path}")
+            dg.run(["fetch", "--prune", "origin", self.args.downstream_branch])
+            dg.run(["checkout", "-B", self.args.downstream_branch,
+                    f"origin/{self.args.downstream_branch}"])
+            dg.run(["reset", "--hard", f"origin/{self.args.downstream_branch}"])
+            dg.run(["clean", "-fd"])
+        else:
+            print("Reference refresh skipped by request.")
+
+        target = ug.rev_parse(self.args.target)
+        downstream = dg.rev_parse(self.args.downstream_branch)
+        return ug, dg, target, downstream
+
+
+class KernelBackporter:
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        repo = args.repo or os.environ.get("KERNEL_SRC_DIR") or "."
+        self.repo = Path(repo).expanduser().resolve()
+        self.work_git = Git(self.repo, args.debug)
+        if not (self.repo / ".git").exists() and not self.work_git.ok(["rev-parse", "--git-dir"]):
+            raise KBError(f"not a git repository: {self.repo}")
+        self.start_head = self.work_git.rev_parse("HEAD")
+        self.refs = ReferenceManager(args, self.work_git)
+        self.upstream: Git
+        self.current_ds: Git
+        self.target: str
+        self.current_ds_head: str
+        self.work_index: ProvenanceIndex
+        self.current_index: ProvenanceIndex
+        self.requested: str = ""
+        self.plan: set[str] = set()
+        self.auto_added: set[str] = set()
+        self.reason_map: dict[str, list[str]] = collections.defaultdict(list)
+        self._aliases: dict[str, set[str]] = {}
+        self._subject: dict[str, str] = {}
+        self._body: dict[str, str] = {}
+        self._files: dict[str, list[str]] = {}
+        self._candidate_seen: set[str] = set()
+        self._patch_id_cache: dict[tuple[str, str], str | None] = {}
+        self._patch_scan_cache: dict[tuple[str, str, tuple[str, ...]], dict[str, str]] = {}
+        self.latest_conflict: ConflictInfo | None = None
+        self.outdated_dependencies: list[tuple[str, IdentityMatch]] = []
+        self.report_root = Path(args.report_dir).expanduser().resolve()
+        self.diff_dir = Path(args.diff_dir).expanduser().resolve()
+        self.patch_dir = Path(args.patch_dir).expanduser().resolve()
+
+    def prepare(self) -> None:
+        if not self.work_git.status_clean():
+            raise KBError(
+                "working tree is not clean. Commit/stash changes before running kernel-backporter; "
+                "the orchestrator will not guess which local edits are sacred."
+            )
+        self.upstream, self.current_ds, self.target, self.current_ds_head = self.refs.prepare()
+        self.requested = self.upstream.rev_parse(self.args.commit)
+        if not self.upstream.is_ancestor(self.requested, self.target):
+            raise KBError(
+                f"requested commit {self.requested} is not an ancestor of target {self.args.target} "
+                f"({self.target})"
+            )
+
+        print("\nReference repositories:")
+        print(f"  upstream:   {self.refs.upstream_path}")
+        print(f"  downstream: {self.refs.downstream_path}")
+        print(f"  target:     {self.args.target} -> {self.target}")
+        print(f"  CS10 today: {self.current_ds_head}")
+        print(f"  work HEAD:  {self.start_head}")
+
+        print("\nIndexing downstream provenance...")
+        self.work_index = ProvenanceIndex(self.work_git, "HEAD", "working-tree", self.args.debug)
+        self.current_index = ProvenanceIndex(
+            self.current_ds, self.args.downstream_branch, "current-downstream", self.args.debug
+        )
+
+    def subject(self, sha: str) -> str:
+        if sha not in self._subject:
+            self._subject[sha] = self.upstream.subject(sha)
+        return self._subject[sha]
+
+    def body(self, sha: str) -> str:
+        if sha not in self._body:
+            self._body[sha] = self.upstream.body(sha)
+        return self._body[sha]
+
+    def files(self, sha: str) -> list[str]:
+        if sha not in self._files:
+            self._files[sha] = self.upstream.changed_files(sha)
+        return self._files[sha]
+
+    def aliases(self, sha: str) -> set[str]:
+        if sha in self._aliases:
+            return self._aliases[sha]
+        result = {sha.lower()}
+        body = self.body(sha)
+        for regex in (UPSTREAM_COMMIT_RE, STABLE_UPSTREAM_RE):
+            result.update(x.lower() for x in regex.findall(body))
+        self._aliases[sha] = result
+        return result
+
+    def _patch_id(self, git: Git, sha: str) -> str | None:
+        key = (str(git.cwd), sha)
+        if key in self._patch_id_cache:
+            return self._patch_id_cache[key]
+        if len(git.parents(sha)) != 1:
+            self._patch_id_cache[key] = None
+            return None
+        patch = git.run(["show", "--pretty=format:", "--binary", sha], check=False)
+        if not patch.strip():
+            self._patch_id_cache[key] = None
+            return None
+        cp = subprocess.run(
+            ["git", "patch-id", "--stable"], cwd=str(git.cwd), input=patch,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        pid = cp.stdout.split()[0] if cp.returncode == 0 and cp.stdout.split() else None
+        self._patch_id_cache[key] = pid
+        return pid
+
+    def _patch_id_map(self, git: Git, ref: str, files: list[str]) -> dict[str, str]:
+        key = (str(git.cwd), ref, tuple(sorted(files)))
+        if key in self._patch_scan_cache:
+            return self._patch_scan_cache[key]
+        cmd = [
+            "git", "log", "--no-merges", "-p", "--binary",
+            "--pretty=format:commit %H", ref,
+        ]
+        if files:
+            cmd.extend(["--", *files])
+        log_cp = subprocess.Popen(
+            cmd, cwd=str(git.cwd), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="surrogateescape",
+        )
+        assert log_cp.stdout is not None
+        pid_cp = subprocess.run(
+            ["git", "patch-id", "--stable"], cwd=str(git.cwd), stdin=log_cp.stdout,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            encoding="utf-8", errors="surrogateescape",
+        )
+        log_cp.stdout.close()
+        log_stderr = log_cp.stderr.read() if log_cp.stderr else ""
+        log_rc = log_cp.wait()
+        if log_rc or pid_cp.returncode:
+            if self.args.debug:
+                print(
+                    f"patch-id scan failed for {git.cwd}:{ref}: "
+                    f"{log_stderr.strip()} {pid_cp.stderr.strip()}", file=sys.stderr
+                )
+            result: dict[str, str] = {}
+        else:
+            result = {}
+            for line in pid_cp.stdout.splitlines():
+                fields = line.split()
+                if len(fields) >= 2:
+                    result.setdefault(fields[0], fields[1])
+        self._patch_scan_cache[key] = result
+        return result
+
+    def _match_with_patch_id(
+        self, index: ProvenanceIndex, downstream_git: Git, downstream_ref: str,
+        sha: str, source: str
+    ) -> IdentityMatch:
+        m = index.match_aliases(self.aliases(sha))
+        if m.present or self.args.no_patch_id:
+            return m
+        pid = self._patch_id(self.upstream, sha)
+        if not pid:
+            return m
+        mapping = self._patch_id_map(downstream_git, downstream_ref, self.files(sha))
+        ds = mapping.get(pid)
+        if ds:
+            return IdentityMatch(True, ds, "patch-id", source, "high")
+        return m
+
+    def match_working(self, sha: str) -> IdentityMatch:
+        return self._match_with_patch_id(
+            self.work_index, self.work_git, "HEAD", sha, "working-tree"
+        )
+
+    def match_current(self, sha: str) -> IdentityMatch:
+        return self._match_with_patch_id(
+            self.current_index, self.current_ds, self.args.downstream_branch, sha,
+            "current-downstream"
+        )
+
+    def resolve_short(self, short: str) -> str | None:
+        out = self.upstream.run(["rev-parse", "--verify", f"{short}^{{commit}}"], check=False).strip()
+        return out or None
+
+    def fixes_targets(self, sha: str) -> list[str]:
+        result: list[str] = []
+        for short in FIXES_RE.findall(self.body(sha)):
+            full = self.resolve_short(short)
+            if full:
+                result.append(full)
+        return result
+
+    def _simulation_clone(self) -> tuple[Path, Git]:
+        root = Path(tempfile.mkdtemp(prefix="kernel-backporter-"))
+        sim = root / "repo"
+        cp = subprocess.run(
+            ["git", "clone", "--shared", "--no-checkout", str(self.repo), str(sim)],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        if cp.returncode:
+            shutil.rmtree(root, ignore_errors=True)
+            raise KBError(f"failed to create simulation clone: {cp.stderr.strip()}")
+        sg = Git(sim, self.args.debug)
+        sg.run(["checkout", "--detach", self.start_head])
+        return root, sg
+
+    def ordered_plan(self, selected: set[str] | None = None) -> list[str]:
+        selected = selected or self.plan
+        if not selected:
+            return []
+        # Every automatically selected dependency must be an ancestor of the
+        # requested commit.  Filter the requested commit's ancestry in topo order.
+        revs = self.upstream.run([
+            "rev-list", "--reverse", "--topo-order", self.requested
+        ]).splitlines()
+        return [x for x in revs if x in selected]
+
+    def simulate(self, selected: set[str] | None = None, *, run_check: bool = False) -> SequenceResult:
+        order = self.ordered_plan(selected)
+        root, sg = self._simulation_clone()
+        applied: list[str] = []
+        try:
+            for sha in order:
+                sg.run(["fetch", "--no-tags", str(self.refs.upstream_path), sha])
+                cp = sg._run_cp(["cherry-pick", "--no-commit", sha], check=False)
+                if cp.returncode:
+                    files = [x for x in sg.run([
+                        "diff", "--name-only", "--diff-filter=U"
+                    ], check=False).splitlines() if x]
+                    conflict = ConflictInfo(sha, files, cp.stdout, cp.stderr)
+                    return SequenceResult(False, applied, conflict)
+
+                tree = sg.run(["write-tree"]).strip()
+                env = {
+                    **os.environ,
+                    "GIT_AUTHOR_NAME": "kernel-backporter",
+                    "GIT_AUTHOR_EMAIL": "kernel-backporter@example.invalid",
+                    "GIT_COMMITTER_NAME": "kernel-backporter",
+                    "GIT_COMMITTER_EMAIL": "kernel-backporter@example.invalid",
+                }
+                cp2 = subprocess.run(
+                    ["git", "commit-tree", tree, "-p", "HEAD"], cwd=str(sg.cwd),
+                    input=self.body(sha), text=True, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, env=env,
+                )
+                if cp2.returncode:
+                    raise KBError(cp2.stderr.strip())
+                sg.run(["reset", "--hard", cp2.stdout.strip()])
+                applied.append(sha)
+
+            if run_check and self.args.check_command:
+                cp = subprocess.run(
+                    self.args.check_command, cwd=str(sg.cwd), shell=True, text=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                )
+                return SequenceResult(
+                    cp.returncode == 0, applied, None,
+                    check_rc=cp.returncode, check_output=cp.stdout,
+                )
+            return SequenceResult(True, applied)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def parse_hunks(self, sha: str, only_paths: set[str] | None = None) -> list[tuple[str, int, int, int, int, list[str]]]:
+        parents = self.upstream.parents(sha)
+        if len(parents) != 1:
+            return []
+        diff = self.upstream.run(["diff", "--unified=0", parents[0], sha, "--"])
+        path: str | None = None
+        current = None
+        hunks = []
+        for line in diff.splitlines():
+            fm = DIFF_FILE_RE.match(line)
+            if fm:
+                path = fm.group(2)
+                current = None
+                continue
+            hm = HUNK_RE.match(line)
+            if hm and path and (only_paths is None or path in only_paths):
+                current = [
+                    path,
+                    int(hm.group(1)), int(hm.group(2) or "1"),
+                    int(hm.group(3)), int(hm.group(4) or "1"),
+                    [],
+                ]
+                hunks.append(current)
+                continue
+            if current is not None and line.startswith("+") and not line.startswith("+++"):
+                current[5].append(line[1:])
+        return [tuple(x) for x in hunks]  # type: ignore[return-value]
+
+    def blame_range(self, revision: str, path: str, start: int, end: int) -> collections.Counter[str]:
+        if end < start or start < 1:
+            return collections.Counter()
+        out = self.upstream.run([
+            "blame", "--porcelain", "-L", f"{start},{end}", revision, "--", path
+        ], check=False)
+        result: collections.Counter[str] = collections.Counter()
+        for line in out.splitlines():
+            m = re.match(rf"^({HEX40})\s", line)
+            if m:
+                result[m.group(1).lower()] += 1
+        return result
+
+    def extract_symbols(self, sha: str, only_paths: set[str] | None = None) -> set[str]:
+        symbols: set[str] = set()
+        for path, _os, _oc, _ns, _nc, added in self.parse_hunks(sha, only_paths):
+            del path
+            for line in added:
+                for sym in FUNC_CALL_RE.findall(line):
+                    if sym not in C_KEYWORDS and sym not in IGNORE_SYMBOLS:
+                        symbols.add(sym)
+                for sym in MACRO_RE.findall(line):
+                    if sym not in IGNORE_SYMBOLS and not sym.startswith("CONFIG_"):
+                        symbols.add(sym)
+        return set(sorted(symbols)[: self.args.max_symbols])
+
+    def symbol_definition_dependency(self, sha: str, symbol: str) -> str | None:
+        parents = self.upstream.parents(sha)
+        if len(parents) != 1:
+            return None
+        parent = parents[0]
+        out = self.upstream.run([
+            "grep", "-n", "-E", rf"\b{re.escape(symbol)}\b", parent, "--", "*.c", "*.h"
+        ], check=False)
+        for raw in out.splitlines()[:300]:
+            m = re.match(r"^[^:]+:(.+?):(\d+):(.*)$", raw)
+            if not m:
+                continue
+            path, line_s, text = m.groups()
+            text_s = text.strip()
+            definitionish = (
+                re.search(rf"^#\s*define\s+{re.escape(symbol)}\b", text_s)
+                or re.search(rf"\b{re.escape(symbol)}\s*\([^;]*\)\s*(?:\{{|$)", text_s)
+                or re.search(rf"\b(?:enum|struct|union|typedef)\b.*\b{re.escape(symbol)}\b", text_s)
+            )
+            if not definitionish:
+                continue
+            blame = self.blame_range(parent, path, int(line_s), int(line_s))
+            if blame:
+                dep = blame.most_common(1)[0][0]
+                if dep != sha and self.upstream.is_ancestor(dep, sha):
+                    return dep
+        return None
+
+    def dependency_candidates(self, conflict: ConflictInfo) -> list[DependencyCandidate]:
+        sha = conflict.sha
+        only = set(conflict.files)
+        scores: collections.Counter[str] = collections.Counter()
+        reasons: dict[str, set[str]] = collections.defaultdict(set)
+        dep_files: dict[str, set[str]] = collections.defaultdict(set)
+        parents = self.upstream.parents(sha)
+        if len(parents) != 1:
+            return []
+        parent = parents[0]
+
+        # A Fixes: target is strong semantic context when it is not already
+        # represented in the working downstream.
+        for fixed in self.fixes_targets(sha):
+            if self.upstream.is_ancestor(fixed, sha):
+                scores[fixed] += 100
+                reasons[fixed].add("Fixes-target")
+
+        # Exact hunk preimage and nearby context provenance.  This reproduces
+        # the useful part of the manual per-file history investigation without
+        # assuming every commit in the file log is a prerequisite.
+        for path, old_start, old_count, _new_start, _new_count, _added in self.parse_hunks(sha, only):
+            if old_count:
+                blame = self.blame_range(parent, path, old_start, old_start + old_count - 1)
+                for dep, count in blame.items():
+                    scores[dep] += 12 * count
+                    reasons[dep].add(f"hunk-preimage:{path}")
+                    dep_files[dep].add(path)
+            lo = max(1, old_start - self.args.context_lines)
+            hi = max(lo, old_start + max(old_count, 1) + self.args.context_lines)
+            blame = self.blame_range(parent, path, lo, hi)
+            for dep, count in blame.items():
+                scores[dep] += count
+                reasons[dep].add(f"nearby-context:{path}")
+                dep_files[dep].add(path)
+
+        # New API/macro uses can originate outside the subsystem entirely.
+        for sym in self.extract_symbols(sha, only):
+            dep = self.symbol_definition_dependency(sha, sym)
+            if dep:
+                scores[dep] += 25
+                reasons[dep].add(f"symbol:{sym}")
+
+        candidates: list[DependencyCandidate] = []
+        for dep, score in scores.most_common():
+            if dep == sha or dep in self.plan or dep in self._candidate_seen:
+                continue
+            if len(self.upstream.parents(dep)) != 1:
+                # Never automatically cherry-pick an upstream merge commit.
+                continue
+            if not self.upstream.is_ancestor(dep, sha):
+                continue
+            work_match = self.match_working(dep)
+            if work_match.present:
+                continue
+            current_match = self.match_current(dep)
+            if current_match.present:
+                self.outdated_dependencies.append((dep, current_match))
+                continue
+            candidates.append(DependencyCandidate(
+                dep, score, sorted(reasons[dep]), sorted(dep_files[dep])
+            ))
+        return candidates
+
+    def later_context(self, sha: str, files: list[str]) -> list[tuple[str, IdentityMatch, str]]:
+        if not files:
+            return []
+        out = self.upstream.run([
+            "log", "--no-merges", "--format=%H", f"{sha}..{self.target}", "--", *files
+        ], check=False)
+        found: list[tuple[str, IdentityMatch, str]] = []
+        for later in out.splitlines()[: self.args.max_later_context]:
+            m = self.match_working(later)
+            if not m.present:
+                m = self.match_current(later)
+            if m.present:
+                found.append((later, m, self.subject(later)))
+        return found
+
+    def later_merge_risks(self, sha: str, files: list[str]) -> list[str]:
+        if not files:
+            return []
+        out = self.upstream.run([
+            "log", "--merges", "--format=%H", "--ancestry-path", f"{sha}..{self.target}",
+            "--", *files
+        ], check=False)
+        return out.splitlines()[: self.args.max_merge_risks]
+
+    def seed_fixes_dependency(self) -> None:
+        for fixed in self.fixes_targets(self.requested):
+            if not self.upstream.is_ancestor(fixed, self.requested):
+                continue
+            if self.match_working(fixed).present:
+                continue
+            cm = self.match_current(fixed)
+            if cm.present:
+                self.outdated_dependencies.append((fixed, cm))
+                continue
+            self.plan.add(fixed)
+            self.auto_added.add(fixed)
+            self.reason_map[fixed].append(f"Fixes-target of {self.requested[:12]}")
+
+    def discover_plan(self) -> SequenceResult:
+        self.plan = {self.requested}
+        self.seed_fixes_dependency()
+
+        requested_work = self.match_working(self.requested)
+        if requested_work.present:
+            print(
+                f"Requested commit is already represented in the working tree via "
+                f"{requested_work.method}: {requested_work.downstream_sha}"
+            )
+            self.plan.clear()
+            return SequenceResult(True, [])
+
+        requested_current = self.match_current(self.requested)
+        if requested_current.present and not requested_work.present:
+            raise KBError(
+                "requested commit is already present in today's CS10 reference but not in your "
+                f"working tree (CS10 commit {requested_current.downstream_sha}). Sync/rebase the "
+                "working tree instead of creating a duplicate backport."
+            )
+
+        print("\nPreflighting requested backport in an isolated clone...")
+        for round_no in range(1, self.args.max_rounds + 1):
+            result = self.simulate()
+            if result.clean:
+                if self.args.check_command:
+                    checked = self.simulate(run_check=True)
+                    if checked.clean:
+                        return checked
+                    # Build/test failure is not currently permission to invent a
+                    # code fix.  We do a narrow symbol-recovery pass below.
+                    if checked.check_output:
+                        added = self.add_build_symbol_dependencies(checked.check_output)
+                        if added:
+                            print(
+                                f"  round {round_no}: build/test exposed {added} additional "
+                                "upstream symbol prerequisite(s); retrying"
+                            )
+                            continue
+                    return checked
+                return result
+
+            assert result.conflict is not None
+            self.latest_conflict = result.conflict
+            c = result.conflict
+            print(
+                f"  round {round_no}: conflict at {c.sha[:12]} {self.subject(c.sha)}"
+            )
+            for path in c.files:
+                print(f"      {path}")
+
+            candidates = self.dependency_candidates(c)
+            if not candidates:
+                return result
+
+            # Add one strongest candidate at a time.  This makes the next replay
+            # an experiment: did this piece of upstream history actually move us
+            # toward a clean cherry-pick?  A later minimization pass removes any
+            # candidate that turned out not to be necessary.
+            cand = candidates[0]
+            self._candidate_seen.add(cand.sha)
+            self.plan.add(cand.sha)
+            self.auto_added.add(cand.sha)
+            self.reason_map[cand.sha].extend(cand.reasons)
+            print(
+                f"      trying prerequisite {cand.sha[:12]} (score {cand.score}): "
+                f"{self.subject(cand.sha)}"
+            )
+
+        return self.simulate()
+
+    def add_build_symbol_dependencies(self, output: str) -> int:
+        symbols: set[str] = set()
+        for regex in BUILD_SYMBOL_RES:
+            for m in regex.finditer(output):
+                symbols.add(m.group("sym"))
+        added = 0
+        for sym in sorted(symbols):
+            dep = self.symbol_definition_dependency(self.requested, sym)
+            if not dep or dep in self.plan or self.match_working(dep).present:
+                continue
+            cm = self.match_current(dep)
+            if cm.present:
+                self.outdated_dependencies.append((dep, cm))
+                continue
+            self.plan.add(dep)
+            self.auto_added.add(dep)
+            self.reason_map[dep].append(f"build-symbol:{sym}")
+            added += 1
+        return added
+
+    def minimize_plan(self) -> None:
+        if not self.auto_added or self.latest_conflict is None:
+            return
+        print("\nChecking whether discovered prerequisites are actually necessary...")
+        changed = True
+        while changed:
+            changed = False
+            # Newest first tends to remove redundant context helpers quickly.
+            for dep in reversed(self.ordered_plan(self.auto_added)):
+                trial = set(self.plan)
+                trial.discard(dep)
+                result = self.simulate(trial)
+                if result.clean:
+                    print(f"  removing nonessential candidate {dep[:12]} {self.subject(dep)}")
+                    self.plan.remove(dep)
+                    self.auto_added.discard(dep)
+                    changed = True
+                    break
+
+    def patch_series(self) -> tuple[str, list[SeriesPeer]]:
+        if not self.args.series:
+            return "disabled", []
+        links = LINK_RE.findall(self.body(self.requested))
+        msgids: list[str] = []
+        for link in links:
+            m = LORE_MSGID_RE.search(link)
+            if m:
+                msgids.append(m.group(1))
+        if not msgids:
+            return "not-found", []
+
+        # Git send-email commonly produces message IDs with a stable stem and
+        # a per-patch numeric suffix.  Search commit messages in the target
+        # history for that stem.  This is local/inferred series detection, not a
+        # claim that Git history replaces the mailing-list thread.
+        m = SERIES_MSGID_RE.match(msgids[0])
+        if not m:
+            return "link-found-no-local-series", []
+        stem = m.group("stem")
+        tail = m.group("tail")
+        grep = f"{stem}-"
+        raw = self.upstream.run([
+            "log", "--no-merges", "--format=%H", "--fixed-strings", f"--grep={grep}", self.target
+        ], check=False)
+        peers: list[SeriesPeer] = []
+        for sha in raw.splitlines():
+            body = self.body(sha)
+            patch_no: int | None = None
+            same = False
+            for link in LINK_RE.findall(body):
+                lm = LORE_MSGID_RE.search(link)
+                if not lm:
+                    continue
+                mm = SERIES_MSGID_RE.match(lm.group(1))
+                if mm and mm.group("stem") == stem and mm.group("tail") == tail:
+                    same = True
+                    patch_no = int(mm.group("num"))
+                    break
+            if not same:
+                continue
+            wm = self.match_working(sha)
+            cm = self.match_current(sha)
+            if sha == self.requested:
+                status = "REQUESTED"
+                chosen = wm if wm.present else cm
+            elif wm.present:
+                status = "PRESENT-WORKTREE"
+                chosen = wm
+            elif cm.present:
+                status = "PRESENT-CS10-TODAY"
+                chosen = cm
+            else:
+                status = "MISSING"
+                chosen = IdentityMatch()
+            peers.append(SeriesPeer(
+                sha, self.subject(sha), patch_no, status,
+                chosen.downstream_sha, chosen.method,
+            ))
+        peers.sort(key=lambda p: (p.patch_number is None, p.patch_number or 10**9, p.sha))
+        return "inferred-from-lore-message-id", peers
+
+    def print_series(self, method: str, peers: list[SeriesPeer]) -> None:
+        print(f"\nPatch-series discovery: {method}")
+        if not peers:
+            print("  No local series peers identified.")
+            return
+        for peer in peers:
+            num = f"{peer.patch_number:02d}" if peer.patch_number is not None else "??"
+            print(
+                f"  {num}  {peer.sha[:12]}  {peer.status:20s}  {peer.subject}"
+            )
+            if peer.downstream_sha:
+                print(
+                    f"      downstream {peer.downstream_sha[:12]} via {peer.method}"
+                )
+        print("  Series peers are informational; they are never auto-backported merely because they share a series.")
+
+    def later_fixes(self) -> list[str]:
+        short = self.requested[:12]
+        raw = self.upstream.run([
+            "log", "--no-merges", "--format=%H%x00%B%x00", f"{self.requested}..{self.target}"
+        ], check=False)
+        parts = raw.split("\0")
+        result: list[str] = []
+        for i in range(0, len(parts) - 1, 2):
+            sha = parts[i].strip()
+            body = parts[i + 1]
+            for fx in FIXES_RE.findall(body):
+                if self.requested.startswith(fx) or fx.startswith(short):
+                    result.append(sha)
+                    break
+        return result
+
+    def save_upstream_diff(self, sha: str) -> Path:
+        self.diff_dir.mkdir(parents=True, exist_ok=True)
+        path = self.diff_dir / f"{sha}.diff"
+        path.write_text(self.upstream.run(["show", sha]))
+        return path
+
+    def commit_message(self, sha: str) -> str:
+        subject = self.subject(sha)
+        header = self.upstream.medium_header(sha)
+        name = self.args.signoff_name or self.work_git.run(["config", "user.name"], check=False).strip()
+        email = self.args.signoff_email or self.work_git.run(["config", "user.email"], check=False).strip()
+        if not name or not email:
+            raise KBError(
+                "git user.name/user.email are required for Signed-off-by; set them or use "
+                "--signoff-name/--signoff-email"
+            )
+        return (
+            f"{subject}\n\n"
+            f"JIRA: {self.args.jira_url.rstrip('/')}/{self.args.jira}\n\n"
+            f"{header}\n\n"
+            f"(cherry picked from commit {sha})\n"
+            f"Signed-off-by: {name} <{email}>\n"
+        )
+
+    def apply_real(self) -> list[str]:
+        if self.args.dry_run:
+            return []
+        if self.work_git.rev_parse("HEAD") != self.start_head:
+            raise KBError("working HEAD changed during analysis; refusing to apply the preflighted plan")
+        if not self.work_git.status_clean():
+            raise KBError("working tree changed during analysis; refusing to apply")
+
+        commits: list[str] = []
+        print("\nApplying preflighted sequence to the real working tree...")
+        for sha in self.ordered_plan():
+            self.save_upstream_diff(sha)
+            self.work_git.run(["fetch", "--no-tags", str(self.refs.upstream_path), sha])
+            cp = self.work_git._run_cp(["cherry-pick", "--no-commit", sha], check=False)
+            if cp.returncode:
+                raise KBError(
+                    f"unexpected real-tree cherry-pick failure at {sha}; the preflight was clean. "
+                    "The conflict has been left in the working tree for inspection."
+                )
+            msg = self.commit_message(sha)
+            with tempfile.NamedTemporaryFile("w", delete=False, prefix="kernel-backporter-msg-") as tf:
+                tf.write(msg)
+                msg_path = tf.name
+            try:
+                self.work_git.run(["commit", "-F", msg_path])
+            finally:
+                Path(msg_path).unlink(missing_ok=True)
+            new_sha = self.work_git.rev_parse("HEAD")
+            commits.append(new_sha)
+            self.patch_dir.mkdir(parents=True, exist_ok=True)
+            self.work_git.run(["format-patch", "-1", "HEAD", "-o", str(self.patch_dir)])
+            print(f"  {sha[:12]} -> {new_sha[:12]}  {self.subject(sha)}")
+        return commits
+
+    def write_dossier(self, result: SequenceResult) -> Path | None:
+        conflict = result.conflict
+        if conflict is None:
+            return None
+        root = self.report_root / self.requested
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "requested.diff").write_text(self.upstream.run(["show", self.requested]))
+        (root / "conflict-summary.txt").write_text(
+            f"requested: {self.requested} {self.subject(self.requested)}\n"
+            f"failed-at: {conflict.sha} {self.subject(conflict.sha)}\n"
+            f"files:\n" + "".join(f"  {x}\n" for x in conflict.files)
+        )
+
+        parents = self.upstream.parents(conflict.sha)
+        parent = parents[0] if len(parents) == 1 else None
+        for path in conflict.files:
+            safe = path.replace("/", "__")
+            d = root / safe
+            d.mkdir(parents=True, exist_ok=True)
+            if parent:
+                text = self.upstream.run(["show", f"{parent}:{path}"], check=False)
+                (d / "upstream-parent.c").write_text(text)
+            (d / "upstream-after.c").write_text(
+                self.upstream.run(["show", f"{conflict.sha}:{path}"], check=False)
+            )
+            (d / "upstream-target.c").write_text(
+                self.upstream.run(["show", f"{self.target}:{path}"], check=False)
+            )
+            (d / "downstream-working.c").write_text(
+                self.work_git.run(["show", f"HEAD:{path}"], check=False)
+            )
+            (d / "downstream-current.c").write_text(
+                self.current_ds.run(["show", f"{self.current_ds_head}:{path}"], check=False)
+            )
+            history = self.upstream.run([
+                "log", "--oneline", "--decorate=no", self.target, "--", path
+            ], check=False)
+            (d / "upstream-history.txt").write_text(history)
+
+        candidates = self.dependency_candidates(conflict)
+        lines = []
+        for c in candidates:
+            lines.append(
+                f"{c.sha} score={c.score} {self.subject(c.sha)}\n"
+                f"    reasons: {', '.join(c.reasons)}\n"
+            )
+        (root / "candidate-dependencies.txt").write_text("".join(lines))
+        later = self.later_context(conflict.sha, conflict.files)
+        with (root / "later-downstream-context.txt").open("w") as f:
+            for sha, match, subject in later:
+                f.write(
+                    f"{sha} {subject}\n"
+                    f"    downstream={match.downstream_sha} via={match.method} source={match.source}\n"
+                )
+        merges = self.later_merge_risks(conflict.sha, conflict.files)
+        (root / "later-merge-risks.txt").write_text("\n".join(merges) + ("\n" if merges else ""))
+        return root
+
+    def write_report(
+        self,
+        result: SequenceResult,
+        series_method: str,
+        peers: list[SeriesPeer],
+        real_commits: list[str],
+        dossier: Path | None,
+    ) -> Path:
+        root = self.report_root / self.requested
+        root.mkdir(parents=True, exist_ok=True)
+        report = root / "report.txt"
+        lines: list[str] = []
+        lines.append(f"requested:   {self.requested}  {self.subject(self.requested)}")
+        lines.append(f"target:      {self.args.target} -> {self.target}")
+        lines.append(f"work-head:   {self.start_head}")
+        lines.append(f"cs10-today:  {self.current_ds_head}")
+        lines.append(f"upstream:    {self.refs.upstream_path}")
+        lines.append(f"downstream:  {self.refs.downstream_path}")
+        lines.append("")
+        lines.append("PROPOSED / APPLIED SEQUENCE")
+        lines.append("=" * 80)
+        for i, sha in enumerate(self.ordered_plan(), 1):
+            kind = "REQUESTED" if sha == self.requested else "PREREQUISITE"
+            lines.append(f"{i:3d}. {sha} [{kind}] {self.subject(sha)}")
+            if sha in self.reason_map:
+                lines.append("     reasons: " + ", ".join(sorted(set(self.reason_map[sha]))))
+        lines.append("")
+        lines.append(f"preflight: {'CLEAN' if result.clean else 'STOPPED'}")
+        if result.check_rc is not None:
+            lines.append(f"check-command rc: {result.check_rc}")
+        if result.conflict:
+            lines.append(
+                f"conflict: {result.conflict.sha} {self.subject(result.conflict.sha)}"
+            )
+            lines.extend(f"    {x}" for x in result.conflict.files)
+        if self.outdated_dependencies:
+            lines.append("")
+            lines.append("DEPENDENCIES PRESENT IN TODAY'S CS10 BUT NOT WORKING TREE")
+            lines.append("=" * 80)
+            for sha, match in self.outdated_dependencies:
+                lines.append(
+                    f"{sha} {self.subject(sha)}\n"
+                    f"    CS10={match.downstream_sha} via={match.method}"
+                )
+        lines.append("")
+        lines.append(f"PATCH SERIES: {series_method}")
+        lines.append("=" * 80)
+        if peers:
+            for p in peers:
+                num = f"{p.patch_number:02d}" if p.patch_number is not None else "??"
+                lines.append(f"{num}  {p.sha}  {p.status:20s}  {p.subject}")
+                if p.downstream_sha:
+                    lines.append(f"    downstream={p.downstream_sha} via={p.method}")
+        else:
+            lines.append("No local series peers identified.")
+
+        fixes = self.later_fixes()
+        lines.append("")
+        lines.append("LATER FIXES OF REQUESTED COMMIT")
+        lines.append("=" * 80)
+        if fixes:
+            for sha in fixes:
+                lines.append(f"{sha} {self.subject(sha)}")
+        else:
+            lines.append("None identified through Fixes: tags before target.")
+
+        if real_commits:
+            lines.append("")
+            lines.append("DOWNSTREAM COMMITS CREATED")
+            lines.append("=" * 80)
+            lines.extend(real_commits)
+        if dossier:
+            lines.append("")
+            lines.append(f"conflict dossier: {dossier}")
+        report.write_text("\n".join(lines) + "\n")
+
+        payload = {
+            "requested": self.requested,
+            "requested_subject": self.subject(self.requested),
+            "target": self.target,
+            "target_name": self.args.target,
+            "work_head": self.start_head,
+            "current_downstream": self.current_ds_head,
+            "sequence": self.ordered_plan(),
+            "reasons": {k: sorted(set(v)) for k, v in self.reason_map.items()},
+            "preflight_clean": result.clean,
+            "conflict": None if not result.conflict else dataclasses.asdict(result.conflict),
+            "check_rc": result.check_rc,
+            "check_output": result.check_output,
+            "series_method": series_method,
+            "series": [dataclasses.asdict(p) for p in peers],
+            "later_fixes": fixes,
+            "real_commits": real_commits,
+            "dossier": None if dossier is None else str(dossier),
+            "references": {
+                "upstream": str(self.refs.upstream_path),
+                "downstream": str(self.refs.downstream_path),
+            },
+            "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+        (root / "report.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        return report
+
+    def run(self) -> int:
+        self.prepare()
+        self.save_upstream_diff(self.requested)
+        series_method, peers = self.patch_series()
+        self.print_series(series_method, peers)
+
+        result = self.discover_plan()
+        if result.clean and self.auto_added:
+            self.minimize_plan()
+            # Re-run after minimization, including the optional check command.
+            result = self.simulate(run_check=bool(self.args.check_command))
+
+        dossier = None
+        real_commits: list[str] = []
+        if result.clean:
+            print("\nPreflight result: CLEAN")
+            print("Sequence:")
+            for i, sha in enumerate(self.ordered_plan(), 1):
+                label = "requested" if sha == self.requested else "prerequisite"
+                print(f"  {i}. {sha} [{label}] {self.subject(sha)}")
+            if self.args.dry_run:
+                print("\n--dry-run specified; real working tree was not modified.")
+            else:
+                real_commits = self.apply_real()
+        else:
+            print("\nPreflight result: STOPPED")
+            if result.conflict:
+                later = self.later_context(result.conflict.sha, result.conflict.files)
+                if later:
+                    print("Later upstream context already represented downstream:")
+                    for sha, match, subject in later:
+                        print(
+                            f"  {sha[:12]} -> {match.downstream_sha[:12] if match.downstream_sha else '?'} "
+                            f"{subject}"
+                        )
+                print("No clean upstream prerequisite sequence was proven. Manual resolution required.")
+                dossier = self.write_dossier(result)
+                print(f"Conflict dossier: {dossier}")
+            elif result.check_rc is not None:
+                print(f"Build/test command failed with rc={result.check_rc}; no source edit was attempted.")
+
+        report = self.write_report(result, series_method, peers, real_commits, dossier)
+        print(f"Report: {report}")
+        if result.clean:
+            return 0
+        return 2 if result.conflict else 3
+
+
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Dependency-aware Linux kernel backport orchestrator",
+        epilog=textwrap.dedent(
+            """\
+            Familiar usage:
+              kernel-backporter -l stable -j RHEL-223619 -c 35c3dcb1ac2c --target v7.0
+
+            Safe first test:
+              kernel-backporter -l stable -j RHEL-223619 -c 35c3dcb1ac2c \\
+                  --target v7.0 --dry-run
+
+            The tool never edits conflicted source automatically.  It only retries
+            by adding known upstream commits and stops when manual source resolution
+            is still required.
+            """
+        ),
+    )
+    p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    p.add_argument("-c", "--commit", required=True, help="upstream commit SHA")
+    p.add_argument("-j", "--jira", required=True, help="Jira ID, e.g. RHEL-223619")
+    p.add_argument("-l", "--linux-repo", choices=("stable", "next"), default="stable")
+    p.add_argument("--target", required=True, help="upstream target tag/commit, e.g. v7.0")
+    p.add_argument(
+        "--repo",
+        help="downstream working repository (default: $KERNEL_SRC_DIR, then current directory)",
+    )
+    p.add_argument(
+        "--reference-root", default="~/projects/kernel-backport/reference",
+        help="tool-managed, user-inspectable reference repositories",
+    )
+    p.add_argument("--upstream-url", help="override upstream reference clone URL")
+    p.add_argument("--downstream-url", help="override current downstream/CS10 clone URL")
+    p.add_argument("--downstream-remote", default="cs10",
+                   help="working-tree remote used to discover downstream URL (default: cs10)")
+    p.add_argument("--downstream-branch", default="main")
+    p.add_argument("--skip-refresh", action="store_true",
+                   help="do not fetch/update reference repositories (normally CS10 is refreshed every run)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="perform orchestration/preflight and reports but do not modify the real working tree")
+    p.add_argument("--no-patch-id", action="store_true",
+                   help="disable stable patch-id fallback when downstream provenance is absent")
+    p.add_argument("--series", action=argparse.BooleanOptionalAction, default=True,
+                   help="report inferred peers from the original lore-linked patch series")
+    p.add_argument("--check-command",
+                   help="optional build/test shell command run after a clean simulated sequence")
+    p.add_argument("--context-lines", type=int, default=3)
+    p.add_argument("--max-symbols", type=int, default=40)
+    p.add_argument("--max-rounds", type=int, default=12,
+                   help="maximum dependency-discovery/replay rounds")
+    p.add_argument("--max-later-context", type=int, default=12)
+    p.add_argument("--max-merge-risks", type=int, default=10)
+    p.add_argument("--report-dir", default="~/backports/kernel-backporter")
+    p.add_argument("--diff-dir", default="~/backport_commit_diffs")
+    p.add_argument("--patch-dir", default="~/",
+                   help="directory for downstream format-patch files")
+    p.add_argument("--jira-url", default="https://issues.redhat.com/browse")
+    p.add_argument("--signoff-name")
+    p.add_argument("--signoff-email")
+    p.add_argument("--debug", action="store_true")
+    return p.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv or sys.argv[1:])
+    print(f"{Path(sys.argv[0]).name} {VERSION}")
+    return KernelBackporter(args).run()
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("kernel-backporter: interrupted", file=sys.stderr)
+        raise SystemExit(130)
+    except KBError as exc:
+        print(f"kernel-backporter: {exc}", file=sys.stderr)
+        raise SystemExit(1)
