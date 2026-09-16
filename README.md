@@ -14,7 +14,7 @@ The central safety rule is simple:
 > `kernel-backporter` may add known upstream prerequisite commits, but it never
 > edits conflicted source code automatically.
 
-Current version: **0.1.4**
+Current version: **0.1.5**
 
 ## What it does
 
@@ -96,7 +96,7 @@ The tool uses only the Python standard library.
 Install the executable somewhere in `PATH`, for example:
 
 ```bash
-cp kernel-backporter-v0.1.4 ~/bin/kernel-backporter
+cp kernel-backporter-v0.1.5 ~/bin/kernel-backporter
 chmod 755 ~/bin/kernel-backporter
 ```
 
@@ -109,7 +109,7 @@ kernel-backporter --version
 Expected:
 
 ```text
-kernel-backporter 0.1.4
+kernel-backporter 0.1.5
 ```
 
 Every normal run also prints the version as its first line.
@@ -127,7 +127,7 @@ kernel-backporter \
     --dry-run
 ```
 
-If the preflight is clean and the proposed sequence is correct, rerun without
+If the preflight succeeds and the proposed sequence is correct, rerun without
 `--dry-run`:
 
 ```bash
@@ -141,7 +141,7 @@ kernel-backporter \
 A successful dry run ends with output similar to:
 
 ```text
-Preflight result: CLEAN
+Preflight result: SUCCESS
 Sequence:
   1. e7e6902fbd19b25630cf6a258c44cb385f16b1c8 [requested] Drivers: hv: Provide arch-neutral implementation of get_vtl()
 
@@ -151,13 +151,15 @@ Sequence:
 A successful real run then applies exactly the preflighted sequence to the
 working tree.
 
-On an interactive terminal, a clean preflight is shown in bold green and a
-stopped preflight is shown in bold red. Patch-series statuses that are already
-present in the working tree or current CS10 are also shown in green. If the
-requested commit is already represented in the working tree, the tool prints a
-bold yellow notice and exits immediately without running or reporting a
-preflight. Color is disabled automatically when standard output is redirected,
-when `TERM=dumb`, or when the `NO_COLOR` environment variable is set.
+On an interactive terminal, a successful preflight is shown as `SUCCESS` in
+bold yellow and a stopped preflight is shown in bold red. A successful real
+backport is reported as `Backport result: COMMITTED` in bold green.
+Patch-series statuses that are already present in the working tree or current
+CS10 are also shown in green. If the requested commit is already represented in
+the working tree, the tool prints a bold yellow notice and exits immediately
+without running or reporting a preflight. Color is disabled automatically when
+standard output is redirected, when `TERM=dumb`, or when the `NO_COLOR`
+environment variable is set.
 
 ## Patch-series discovery
 
@@ -271,7 +273,7 @@ and reports the failure.
 The real working tree is modified only when:
 
 - `--dry-run` is not specified;
-- preflight is clean;
+- preflight succeeds;
 - the working `HEAD` has not changed since analysis began; and
 - the working tree is still clean.
 
@@ -480,8 +482,9 @@ upstream-prerequisite replay is no longer sufficient.
 
 `kernel-backporter` is an engineering assistant, not a policy engine.
 
-A clean preflight means the proposed upstream sequence applies textually to the
-current working tree and, if configured, passes the requested check command. It
+A successful preflight means the proposed upstream sequence applies textually
+to the current working tree and, if configured, passes the requested check
+command. It
 does not prove that every upstream feature belongs in the downstream product.
 
 Likewise:
