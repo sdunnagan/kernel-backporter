@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
 
-VERSION = "0.1.1"
+VERSION = "0.1.3"
 
 
 HEX40 = r"[0-9a-fA-F]{40}"
@@ -67,6 +67,29 @@ IGNORE_SYMBOLS = {
     "WARN_ON", "WARN_ON_ONCE", "BUG_ON", "IS_ENABLED", "ARRAY_SIZE",
     "BIT", "GENMASK", "READ_ONCE", "WRITE_ONCE", "likely", "unlikely",
 }
+
+
+ANSI_RESET = "\033[0m"
+ANSI_BOLD = "\033[1m"
+ANSI_GREEN = "\033[32m"
+ANSI_YELLOW = "\033[33m"
+ANSI_RED = "\033[31m"
+
+
+def stdout_uses_color() -> bool:
+    """Return whether human-facing stdout should use ANSI color."""
+    if "NO_COLOR" in os.environ:
+        return False
+    if os.environ.get("TERM", "").lower() == "dumb":
+        return False
+    return sys.stdout.isatty()
+
+
+def color_stdout(text: str, *codes: str) -> str:
+    """Color text for an interactive terminal, leaving redirected output plain."""
+    if not codes or not stdout_uses_color():
+        return text
+    return "".join(codes) + text + ANSI_RESET
 
 
 class KBError(RuntimeError):
@@ -198,6 +221,7 @@ class SequenceResult:
     conflict: ConflictInfo | None = None
     check_rc: int | None = None
     check_output: str | None = None
+    requested_present: IdentityMatch | None = None
 
 
 @dataclasses.dataclass
@@ -806,16 +830,15 @@ class KernelBackporter:
 
     def discover_plan(self) -> SequenceResult:
         self.plan = {self.requested}
-        self.seed_fixes_dependency()
 
         requested_work = self.match_working(self.requested)
         if requested_work.present:
-            print(
-                f"Requested commit is already represented in the working tree via "
-                f"{requested_work.method}: {requested_work.downstream_sha}"
-            )
             self.plan.clear()
-            return SequenceResult(True, [])
+            return SequenceResult(
+                True, [], requested_present=requested_work
+            )
+
+        self.seed_fixes_dependency()
 
         requested_current = self.match_current(self.requested)
         if requested_current.present and not requested_work.present:
@@ -983,9 +1006,10 @@ class KernelBackporter:
             return
         for peer in peers:
             num = f"{peer.patch_number:02d}" if peer.patch_number is not None else "??"
-            print(
-                f"  {num}  {peer.sha[:12]}  {peer.status:20s}  {peer.subject}"
-            )
+            status = f"{peer.status:20s}"
+            if peer.status in ("PRESENT-WORKTREE", "PRESENT-CS10-TODAY"):
+                status = color_stdout(status, ANSI_GREEN)
+            print(f"  {num}  {peer.sha[:12]}  {status}  {peer.subject}")
             if peer.downstream_sha:
                 print(
                     f"      downstream {peer.downstream_sha[:12]} via {peer.method}"
@@ -1234,6 +1258,16 @@ class KernelBackporter:
         self.print_series(series_method, peers)
 
         result = self.discover_plan()
+        if result.requested_present is not None:
+            match = result.requested_present
+            print()
+            print(color_stdout(
+                "Requested commit is already represented in the working tree via "
+                f"{match.method}: {match.downstream_sha}",
+                ANSI_BOLD, ANSI_YELLOW,
+            ))
+            return 0
+
         if result.clean and self.auto_added:
             self.minimize_plan()
             # Re-run after minimization, including the optional check command.
@@ -1242,7 +1276,7 @@ class KernelBackporter:
         dossier = None
         real_commits: list[str] = []
         if result.clean:
-            print("\nPreflight result: CLEAN")
+            print("\n" + color_stdout("Preflight result: CLEAN", ANSI_BOLD, ANSI_GREEN))
             print("Sequence:")
             for i, sha in enumerate(self.ordered_plan(), 1):
                 label = "requested" if sha == self.requested else "prerequisite"
@@ -1252,7 +1286,7 @@ class KernelBackporter:
             else:
                 real_commits = self.apply_real()
         else:
-            print("\nPreflight result: STOPPED")
+            print("\n" + color_stdout("Preflight result: STOPPED", ANSI_BOLD, ANSI_RED))
             if result.conflict:
                 later = self.later_context(result.conflict.sha, result.conflict.files)
                 if later:
