@@ -14,7 +14,7 @@ The central safety rule is simple:
 > `kernel-backporter` may add known upstream prerequisite commits, but it never
 > edits conflicted source code automatically.
 
-Current version: **0.1.2**
+Current version: **0.1.4**
 
 ## What it does
 
@@ -47,13 +47,18 @@ For one requested upstream commit, `kernel-backporter`:
 The working tree may be a fork with an in-progress backport series.
 `kernel-backporter` does **not** reset or update that working tree.
 
-Instead, it maintains a separate reference clone, by default:
+Instead, it maintains separate tool-managed reference clones under the XDG
+cache directory. With the normal Linux defaults, current CS10 lives at:
 
 ```text
-~/projects/kernel-backport/reference/cs10
+~/.cache/kernel-backporter/reference/cs10
 ```
 
-That reference is refreshed from current official CS10 on each run unless
+If `XDG_CACHE_HOME` is set to an absolute path, that directory is used instead
+of `~/.cache`. `KERNEL_BACKPORTER_REFERENCE_ROOT` can override the complete
+reference root, and `--reference-root` takes precedence over all defaults.
+
+The current-CS10 reference is refreshed from official CS10 on each run unless
 `--skip-refresh` is used. This lets the tool detect cases such as:
 
 ```text
@@ -91,7 +96,7 @@ The tool uses only the Python standard library.
 Install the executable somewhere in `PATH`, for example:
 
 ```bash
-cp kernel-backporter-v0.1.2 ~/bin/kernel-backporter
+cp kernel-backporter-v0.1.4 ~/bin/kernel-backporter
 chmod 755 ~/bin/kernel-backporter
 ```
 
@@ -104,7 +109,7 @@ kernel-backporter --version
 Expected:
 
 ```text
-kernel-backporter 0.1.2
+kernel-backporter 0.1.4
 ```
 
 Every normal run also prints the version as its first line.
@@ -148,9 +153,11 @@ working tree.
 
 On an interactive terminal, a clean preflight is shown in bold green and a
 stopped preflight is shown in bold red. Patch-series statuses that are already
-present in the working tree or current CS10 are also shown in green. Color is
-disabled automatically when standard output is redirected, when `TERM=dumb`, or
-when the `NO_COLOR` environment variable is set.
+present in the working tree or current CS10 are also shown in green. If the
+requested commit is already represented in the working tree, the tool prints a
+bold yellow notice and exits immediately without running or reporting a
+preflight. Color is disabled automatically when standard output is redirected,
+when `TERM=dumb`, or when the `NO_COLOR` environment variable is set.
 
 ## Patch-series discovery
 
@@ -308,9 +315,9 @@ Default locations are:
 
 ```text
 Reference repositories:
-  ~/projects/kernel-backport/reference/linux-stable
-  ~/projects/kernel-backport/reference/linux-next
-  ~/projects/kernel-backport/reference/cs10
+  ~/.cache/kernel-backporter/reference/linux-stable
+  ~/.cache/kernel-backporter/reference/linux-next
+  ~/.cache/kernel-backporter/reference/cs10
 
 Reports:
   ~/backports/kernel-backporter/<requested-upstream-sha>/report.txt
@@ -323,8 +330,10 @@ Downstream format-patch output:
   ~/
 ```
 
-The output directories can be changed with `--reference-root`, `--report-dir`,
-`--diff-dir`, and `--patch-dir`.
+The reference root can also be set with
+`KERNEL_BACKPORTER_REFERENCE_ROOT`. Otherwise it follows `XDG_CACHE_HOME`,
+falling back to `~/.cache`. The other output directories can be changed with
+`--report-dir`, `--diff-dir`, and `--patch-dir`.
 
 ### Report contents
 
@@ -387,7 +396,10 @@ upstream-prerequisite replay is no longer sufficient.
     Downstream working repository. Default: $KERNEL_SRC_DIR, then current directory.
 
 --reference-root PATH
-    Tool-managed reference repositories. Default: ~/projects/kernel-backport/reference.
+    Tool-managed reference repositories. Default precedence:
+    $KERNEL_BACKPORTER_REFERENCE_ROOT, then
+    $XDG_CACHE_HOME/kernel-backporter/reference, then
+    ~/.cache/kernel-backporter/reference.
 
 --upstream-url URL
     Override the discovered upstream clone URL.

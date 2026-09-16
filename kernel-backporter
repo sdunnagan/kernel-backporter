@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 
 
 HEX40 = r"[0-9a-fA-F]{40}"
@@ -90,6 +90,21 @@ def color_stdout(text: str, *codes: str) -> str:
     if not codes or not stdout_uses_color():
         return text
     return "".join(codes) + text + ANSI_RESET
+
+
+def default_reference_root() -> str:
+    """Return the default location for tool-managed reference repositories."""
+    override = os.environ.get("KERNEL_BACKPORTER_REFERENCE_ROOT")
+    if override:
+        return override
+
+    cache_home = os.environ.get("XDG_CACHE_HOME")
+    if cache_home:
+        cache_path = Path(cache_home).expanduser()
+        if cache_path.is_absolute():
+            return str(cache_path / "kernel-backporter" / "reference")
+
+    return str(Path.home() / ".cache" / "kernel-backporter" / "reference")
 
 
 class KBError(RuntimeError):
@@ -1338,8 +1353,14 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="downstream working repository (default: $KERNEL_SRC_DIR, then current directory)",
     )
     p.add_argument(
-        "--reference-root", default="~/projects/kernel-backport/reference",
-        help="tool-managed, user-inspectable reference repositories",
+        "--reference-root",
+        default=default_reference_root(),
+        help=(
+            "tool-managed reference repositories "
+            "(default: $KERNEL_BACKPORTER_REFERENCE_ROOT, then "
+            "$XDG_CACHE_HOME/kernel-backporter/reference, then "
+            "~/.cache/kernel-backporter/reference)"
+        ),
     )
     p.add_argument("--upstream-url", help="override upstream reference clone URL")
     p.add_argument("--downstream-url", help="override current downstream/CS10 clone URL")
