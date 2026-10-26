@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
 
-VERSION = "0.1.5"
+VERSION = "0.2.2"
 
 
 HEX40 = r"[0-9a-fA-F]{40}"
@@ -312,6 +312,8 @@ class ProvenanceIndex:
 
         proc.stdout.close()
         stderr = proc.stderr.read() if proc.stderr else ""
+        if proc.stderr:
+            proc.stderr.close()
         rc = proc.wait()
         if rc:
             raise KBError(
@@ -1327,6 +1329,496 @@ class KernelBackporter:
         return 2 if result.conflict else 3
 
 
+SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+@dataclasses.dataclass
+class BackportPlan:
+    """Validated, immutable input from kernel-backport-planner."""
+
+    path: Path
+    digest: str
+    baseline: str
+    target: str
+    order: list[str]
+    commits: dict[str, dict]
+
+    @classmethod
+    def load(cls, filename: str) -> "BackportPlan":
+        import hashlib
+
+        path = Path(filename).expanduser().resolve()
+        try:
+            raw = path.read_bytes()
+            payload = json.loads(raw)
+        except (OSError, ValueError) as exc:
+            raise KBError(f"cannot load plan {path}: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise KBError("plan JSON must be an object")
+        for field in ("downstream", "target", "replay_start"):
+            if not isinstance(payload.get(field), str) or not SHA40_RE.fullmatch(payload[field]):
+                raise KBError(f"invalid/missing plan {field} (expected full 40-character SHA)")
+        if payload["downstream"] != payload["replay_start"]:
+            raise KBError("plan downstream and replay_start differ; cannot establish execution baseline")
+        order = payload.get("order")
+        commits = payload.get("commits")
+        if not isinstance(order, list) or not isinstance(commits, dict) or not order:
+            raise KBError("plan must provide nonempty order and commits collections")
+        for sha in order:
+            if not isinstance(sha, str) or not SHA40_RE.fullmatch(sha):
+                raise KBError(f"invalid ordered SHA: {sha!r}")
+        if len(set(order)) != len(order):
+            raise KBError("plan order contains duplicate SHAs")
+        for sha in order:
+            record = commits.get(sha)
+            if not isinstance(record, dict):
+                raise KBError(f"ordered commit missing from commits mapping: {sha}")
+            if record.get("selected") is not True or not isinstance(record.get("match"), dict) or record["match"].get("status") != "missing":
+                raise KBError(f"ordered commit is not selected/missing in plan: {sha}")
+            if record.get("advisor_decision") not in ("TAKE", "SKIP", "REVIEW"):
+                raise KBError(f"invalid advisor decision for {sha}: {record.get('advisor_decision')!r}")
+            prereqs = record.get("advisor_prerequisites", [])
+            if not isinstance(prereqs, list):
+                raise KBError(f"invalid advisor prerequisites on {sha}")
+            for item in prereqs:
+                if not isinstance(item, dict) or not isinstance(item.get("sha"), str) or not SHA40_RE.fullmatch(item["sha"]):
+                    raise KBError(f"invalid advisor prerequisite for {sha}: {item!r}")
+        return cls(path, hashlib.sha256(raw).hexdigest(), payload["downstream"],
+                   payload["target"], list(order), commits)
+
+
+class PlanTextProgress:
+    """Render a user-named progress copy of the original planner text report.
+
+    The JSON controls plan order and policy, while the execution journal controls
+    completion status. The original human-readable text is never modified.
+    """
+
+    HEADER_RE = re.compile(
+        r'^(?P<sha>[0-9a-f]{12}) (?:\[[^\]\n]+\] )?\(.*?\) '
+        r'(?P<comment>// (?P<decision>Take|Skip|Review))$', re.MULTILINE
+    )
+
+    def __init__(self, source: Path, plan: BackportPlan):
+        self.source = source
+        try:
+            self.original = source.read_text()
+        except OSError as exc:
+            raise KBError(f"cannot read planner text report {source}: {exc}") from exc
+        self.matches = list(self.HEADER_RE.finditer(self.original))
+        actual = [m.group("sha") for m in self.matches]
+        expected = [sha[:12] for sha in plan.order]
+        if actual != expected:
+            raise KBError(
+                f"planner text report {source} does not match JSON order "
+                f"({len(actual)} text entries versus {len(expected)} JSON entries)"
+            )
+        for match, sha in zip(self.matches, plan.order):
+            decision = plan.commits[sha]["advisor_decision"].capitalize()
+            if match.group("decision") != decision:
+                raise KBError(
+                    f"planner text report decision for {sha[:12]} differs "
+                    "from JSON; refusing to annotate mismatched plans"
+                )
+
+    @staticmethod
+    def _review_reason(reason: str) -> str:
+        if reason.startswith(("preflight failed:",
+                              "unexpected real-tree cherry-pick failure:")):
+            return "Review (conflict)"
+        if reason.startswith("unresolved advisor prerequisite(s):"):
+            return "Review (prerequisite)"
+        return "Review (manual)"
+
+    def render(self, plan: BackportPlan, journal: dict) -> str:
+        entries = {entry["sha"]: entry for entry in journal["entries"]}
+        blocked = journal.get("blocked")
+        chunks = []
+        prev = 0
+        for sha, match in zip(plan.order, self.matches):
+            chunks.append(self.original[prev:match.start("comment")])
+            status = match.group("comment")
+            entry = entries.get(sha)
+            if entry and entry["status"] in ("APPLIED", "APPLIED_MANUALLY"):
+                downstream = entry.get("downstream_sha")
+                if not isinstance(downstream, str) or not SHA40_RE.fullmatch(downstream):
+                    raise KBError(f"journal is missing downstream SHA for {sha}")
+                status = "// Done " + downstream[:12]
+            elif entry and entry["status"] == "ALREADY_PRESENT":
+                status = "// Done (already present)"
+            elif blocked and blocked.get("sha") == sha:
+                status = "// " + self._review_reason(blocked.get("reason", ""))
+            chunks.append(status)
+            prev = match.end("comment")
+        chunks.append(self.original[prev:])
+        return "".join(chunks)
+
+    def write_to(self, destination: Path, plan: BackportPlan, journal: dict) -> Path:
+        """Publish the user-named report atomically, without replacing files."""
+        rendered = self.render(plan, journal)
+        fd, temporary = tempfile.mkstemp(prefix=".backport-progress-",
+                                          dir=destination.parent)
+        try:
+            with os.fdopen(fd, "w") as output:
+                output.write(rendered)
+                output.flush()
+                os.fsync(output.fileno())
+            try:
+                os.link(temporary, destination)
+            except FileExistsError as exc:
+                raise KBError(f"progress output already exists: {destination}") from exc
+            except OSError as exc:
+                raise KBError(f"cannot create progress output {destination}: {exc}") from exc
+            return destination
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+
+
+class PlannedBackporter(KernelBackporter):
+    """Conservative bounded execution of an explicit planner TAKE sequence.
+
+    This mode never runs independent prerequisite discovery. A conflict is a
+    stop condition; it is not permission to import other upstream commits.
+    """
+
+    def __init__(self, args: argparse.Namespace):
+        super().__init__(args)
+        self.batch_plan = BackportPlan.load(args.plan)
+        # Keep journals separate across plan versions AND across different trees.
+        # The journal itself checks canonical repository identity.
+        self.state_dir = self.report_root / "plans" / (
+            self.batch_plan.path.stem + "-" + self.batch_plan.digest[:12]
+        )
+        self.journal_path = (Path(args.journal).expanduser().resolve()
+                             if args.journal else self.state_dir / "journal.json")
+        self.journal: dict = {}
+        self.text_progress: PlanTextProgress | None = None
+        self.progress_output: Path | None = None
+        self.work_index: ProvenanceIndex
+
+    def _new_journal(self) -> dict:
+        return {
+            "schema_version": 1,
+            "plan_sha256": self.batch_plan.digest,
+            "plan_path": str(self.batch_plan.path),
+            "repo": str(self.repo),
+            "branch": self.work_git.run(["symbolic-ref", "--short", "HEAD"], check=False).strip() or "DETACHED",
+            "baseline": self.batch_plan.baseline,
+            "target": self.batch_plan.target,
+            "cursor": 0,
+            "last_head": self.batch_plan.baseline,
+            "entries": [],
+            "blocked": None,
+        }
+
+    def _write_journal(self) -> None:
+        self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".plan-journal-", dir=self.journal_path.parent)
+        try:
+            with os.fdopen(fd, "w") as output:
+                json.dump(self.journal, output, indent=2, sort_keys=True)
+                output.write("\n")
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(tmp, self.journal_path)
+        finally:
+            Path(tmp).unlink(missing_ok=True)
+
+    def _load_journal(self) -> None:
+        if self.args.resume:
+            try:
+                self.journal = json.loads(self.journal_path.read_text())
+            except (OSError, ValueError) as exc:
+                raise KBError(f"cannot resume: journal unavailable or corrupt: {exc}") from exc
+            expected = self._new_journal()
+            for field in ("schema_version", "plan_sha256", "repo", "branch", "baseline", "target"):
+                if self.journal.get(field) != expected[field]:
+                    raise KBError(f"journal {field} differs from this plan/repository")
+            cursor = self.journal.get("cursor")
+            if not isinstance(cursor, int) or not 0 <= cursor <= len(self.batch_plan.order):
+                raise KBError("journal cursor is invalid")
+            if not isinstance(self.journal.get("entries"), list):
+                raise KBError("journal entries are invalid")
+        else:
+            if self.journal_path.exists():
+                raise KBError(f"execution journal already exists; use --resume: {self.journal_path}")
+            self.journal = self._new_journal()
+
+    def _append(self, sha: str, status: str, **other) -> None:
+        self.journal["entries"].append({"sha": sha, "status": status, **other})
+        self.journal["cursor"] += 1
+
+    def _reconcile_head(self) -> None:
+        """Allow exactly one manually completed pending commit, with provenance."""
+        recorded = self.journal["last_head"]
+        actual = self.work_git.rev_parse("HEAD")
+        if actual == recorded:
+            return
+        blocked = self.journal.get("blocked")
+        if not blocked or self.batch_plan.order[self.journal["cursor"]] != blocked["sha"]:
+            raise KBError("working HEAD differs from journal; refusing unrelated/unrecorded commits")
+        if not self.work_git.is_ancestor(recorded, actual):
+            raise KBError("working HEAD has diverged from journal; refusing to resume")
+        new = self.work_git.run(["rev-list", "--reverse", f"{recorded}..{actual}"]).splitlines()
+        if len(new) != 1:
+            raise KBError("expected exactly one manually resolved commit since blocked HEAD")
+        body = self.work_git.body(new[0])
+        upstream = blocked["sha"]
+        markers = set(m.lower() for m in CHERRY_PICK_RE.findall(body))
+        markers.update(m.lower() for m in UPSTREAM_COMMIT_RE.findall(body))
+        if upstream not in markers:
+            raise KBError(
+                "manual commit lacks exact upstream cherry-pick provenance; "
+                "include '(cherry picked from commit <full SHA>)'"
+            )
+        self._append(upstream, "APPLIED_MANUALLY", downstream_sha=new[0])
+        self.journal["last_head"] = actual
+        self.journal["blocked"] = None
+        self._write_journal()
+        print(f"Reconciled manual backport {upstream[:12]} -> {actual[:12]}")
+
+    def prepare_plan(self) -> None:
+        # A progress copy is entirely opt-in. Do not invent or increment names.
+        # Validate paths before any journal or working-tree mutation.
+        if self.args.progress_output:
+            # Avoid resolving the final path component so dangling symlinks
+            # cannot bypass the existence check and redirect the output.
+            destination = Path(os.path.abspath(
+                Path(self.args.progress_output).expanduser()))
+            candidate = (Path(self.args.text_plan).expanduser().resolve()
+                         if self.args.text_plan
+                         else self.batch_plan.path.with_suffix(".c"))
+            if not candidate.is_file():
+                raise KBError(f"planner text report not found: {candidate}")
+            if (os.path.lexists(destination) or
+                    destination in (candidate, self.batch_plan.path,
+                                    self.journal_path)):
+                raise KBError(f"progress output already exists or names an input: {destination}")
+            if not destination.parent.is_dir():
+                raise KBError(f"progress output directory does not exist: {destination.parent}")
+            self.text_progress = PlanTextProgress(candidate, self.batch_plan)
+            self.progress_output = destination
+        elif self.args.text_plan:
+            raise KBError("--text-plan requires --progress-output")
+        if not self.work_git.status_clean():
+            raise KBError("working tree/index is not clean; resolve or commit changes first")
+        if self.args.check_command:
+            raise KBError("--check-command is not supported in plan mode; run kernel-builder separately")
+        self._load_journal()
+        if self.args.resume:
+            if self.args.dry_run and self.work_git.rev_parse("HEAD") != self.journal["last_head"]:
+                raise KBError("dry-run cannot reconcile changed HEAD; resume without --dry-run first")
+            self._reconcile_head()
+        # Reject a stale plan even if the current CS10 remote is now newer.
+        current = self.work_git.rev_parse("HEAD")
+        if self.args.resume:
+            if current != self.journal["last_head"]:
+                raise KBError("working HEAD does not match recorded execution state")
+        elif current != self.batch_plan.baseline:
+            raise KBError(f"working HEAD {current} does not match plan baseline {self.batch_plan.baseline}")
+        self.upstream, self.current_ds, self.target, self.current_ds_head = self.refs.prepare()
+        if self.target != self.batch_plan.target:
+            raise KBError(f"upstream target differs from plan: {self.target} != {self.batch_plan.target}")
+        if not self.work_git.ok(["cat-file", "-e", f"{self.batch_plan.baseline}^{{commit}}"]):
+            raise KBError("plan baseline not found in working Git history")
+        if not self.work_git.is_ancestor(self.batch_plan.baseline, current):
+            raise KBError("plan baseline is not an ancestor of working HEAD")
+        self.work_index = ProvenanceIndex(self.work_git, "HEAD", "working-tree", self.args.debug)
+        if not self.args.dry_run and not self.args.resume:
+            self._write_journal()
+        print(f"Plan: {self.batch_plan.path}")
+        print(f"Plan SHA256: {self.batch_plan.digest}")
+        print(f"Baseline: {self.batch_plan.baseline}")
+        print(f"Working HEAD: {current}")
+        print(f"Selected missing commits: {len(self.batch_plan.order)}")
+        print(f"Journal: {self.journal_path}")
+        if self.current_ds_head != self.batch_plan.baseline:
+            print("NOTE: official CS10 has advanced since the plan; the working baseline is unchanged")
+
+    def _present(self, sha: str, applied: set[str]) -> bool:
+        if sha in applied:
+            return True
+        if self.work_index.match_aliases([sha]).present:
+            return True
+        # Check direct upstream ancestry, including cases where upstream commits
+        # were merged into the downstream repository without provenance trailers.
+        if (self.work_git.ok(["cat-file", "-e", f"{sha}^{{commit}}"])
+                and self.work_git.is_ancestor(sha, "HEAD")):
+            return True
+        return False
+
+    def _blockers(self, sha: str, applied: set[str]) -> list[str]:
+        blockers = []
+        for item in self.batch_plan.commits[sha].get("advisor_prerequisites", []):
+            dependency = item["sha"]
+            if self._present(dependency, applied):
+                continue
+            # A prerequisite marked present in the planner is based on the frozen
+            # downstream baseline; it must still be verified from Git history.
+            blockers.append(dependency)
+        return list(dict.fromkeys(blockers))
+
+    def _pick(self, git: Git, sha: str) -> tuple[bool, str, list[str]]:
+        git.run(["fetch", "--no-tags", str(self.refs.upstream_path), sha])
+        result = git._run_cp(["cherry-pick", "--no-commit", sha], check=False)
+        if result.returncode:
+            files = git.run(["diff", "--name-only", "--diff-filter=U"], check=False).splitlines()
+            return False, (result.stderr or result.stdout).strip(), files
+        # An empty cherry-pick needs investigation (e.g. applied independently);
+        # do not create empty downstream commits or silently mark it successful.
+        if git.ok(["diff", "--cached", "--quiet"]):
+            return False, "cherry-pick yielded no staged changes", []
+        return True, "", []
+
+    def _sim_commit(self, git: Git, sha: str) -> None:
+        git.run(["-c", "user.name=kernel-backporter", "-c", "user.email=kernel-backporter@example.invalid",
+                 "-c", "core.hooksPath=/dev/null", "commit", "-m", f"preflight {sha}"])
+
+    def _real_commit(self, sha: str) -> str:
+        msg = self.commit_message(sha)
+        with tempfile.NamedTemporaryFile("w", delete=False, prefix="kernel-backporter-msg-") as tf:
+            tf.write(msg)
+            msg_path = Path(tf.name)
+        try:
+            self.work_git.run(["commit", "-F", str(msg_path)])
+        finally:
+            msg_path.unlink(missing_ok=True)
+        return self.work_git.rev_parse("HEAD")
+
+    def run(self) -> int:
+        self.prepare_plan()
+        count = 0
+        applied: set[str] = {
+            e["sha"] for e in self.journal["entries"]
+            if e.get("status") in ("APPLIED", "APPLIED_MANUALLY", "ALREADY_PRESENT")
+        }
+        # A single cumulative sandbox represents the evolving downstream tree.
+        # This also makes --dry-run meaningful across multiple commits.
+        root, simulation = self._simulation_clone()
+        cursor = self.journal["cursor"]
+        initial_head = self.work_git.rev_parse("HEAD")
+        try:
+            for position in range(cursor, len(self.batch_plan.order)):
+                sha = self.batch_plan.order[position]
+                rec = self.batch_plan.commits[sha]
+                decision = rec["advisor_decision"]
+                if decision != "TAKE":
+                    print(f"SKIP {sha[:12]}: advisor {decision}")
+                    if not self.args.dry_run:
+                        self._append(sha, "SKIPPED_POLICY", advisor_decision=decision)
+                        self._write_journal()
+                    continue
+                if self._present(sha, applied):
+                    print(f"PRESENT {sha[:12]}: upstream identity already downstream")
+                    applied.add(sha)
+                    if not self.args.dry_run:
+                        self._append(sha, "ALREADY_PRESENT")
+                        self._write_journal()
+                    continue
+                if count >= self.args.max_attempts:
+                    break
+                count += 1
+                blockers = self._blockers(sha, applied)
+                if blockers:
+                    reason = "unresolved advisor prerequisite(s): " + ", ".join(blockers)
+                    return self._stop(sha, reason, [], count)
+                if len(self.upstream.parents(sha)) != 1:
+                    return self._stop(sha, "not a single-parent upstream commit", [], count)
+                if not self.upstream.is_ancestor(sha, self.target):
+                    return self._stop(sha, "upstream commit not reachable from plan target", [], count)
+                ok, details, files = self._pick(simulation, sha)
+                if not ok:
+                    return self._stop(sha, "preflight failed: " + details, files, count)
+                self._sim_commit(simulation, sha)
+                if self.args.dry_run:
+                    print(f"PREFLIGHT OK {sha[:12]} {rec.get('subject', '')}")
+                    applied.add(sha)
+                    continue
+                # Preserve actual working tree invariant, even if an external
+                # process changed it between preflight and application.
+                if self.work_git.rev_parse("HEAD") != self.journal["last_head"] or not self.work_git.status_clean():
+                    return self._stop(sha, "working tree/HEAD changed during preflight", [], count)
+                ok, details, files = self._pick(self.work_git, sha)
+                if not ok:
+                    return self._stop(sha, "unexpected real-tree cherry-pick failure: " + details,
+                                      files, count)
+                # A preflighted cherry-pick and actual cherry-pick must have the
+                # same tree before committing. This protects against drift.
+                if self.work_git.run(["write-tree"]).strip() != simulation.run(["rev-parse", "HEAD^{tree}"]).strip():
+                    return self._stop(sha, "preflight and real working trees differ", [], count)
+                new_sha = self._real_commit(sha)
+                self.journal["last_head"] = new_sha
+                self._append(sha, "APPLIED", downstream_sha=new_sha)
+                self.journal["blocked"] = None
+                self._write_journal()
+                applied.add(sha)
+                print(f"APPLIED {sha[:12]} -> {new_sha[:12]} {rec.get('subject', '')}")
+            if self.args.dry_run:
+                if self.work_git.rev_parse("HEAD") != initial_head or not self.work_git.status_clean():
+                    raise KBError("dry run unexpectedly changed working repository")
+                print(f"Dry run: {count} TAKE attempt(s) preflighted; no working-tree changes")
+            else:
+                self.journal["blocked"] = None
+                self._write_journal()
+                print(f"Batch completed: {count} TAKE attempt(s); journal: {self.journal_path}")
+            return 0
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+            if not self.args.dry_run and self.text_progress is not None:
+                # Use the original text and journal, including blocked status.
+                snapshot = self.text_progress.write_to(
+                    self.progress_output, self.batch_plan, self.journal)
+                print(f"Text plan progress: {snapshot}")
+
+    def _plan_conflict_dossier(self, sha: str, reason: str, files: list[str]) -> Path:
+        """Save a self-contained manual inspection packet without editing source."""
+        import hashlib
+
+        root = self.state_dir / "conflicts" / sha
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "upstream.patch").write_text(self.upstream.run(["show", sha]))
+        (root / "summary.json").write_text(json.dumps({
+            "upstream_sha": sha,
+            "subject": self.subject(sha),
+            "working_head": self.work_git.rev_parse("HEAD"),
+            "reason": reason,
+            "files": files,
+            "advisor_rationale": self.batch_plan.commits[sha].get("advisor_rationale"),
+            "advisor_prerequisites": self.batch_plan.commits[sha].get("advisor_prerequisites", []),
+        }, indent=2, sort_keys=True) + "\n")
+        parents = self.upstream.parents(sha)
+        for path in files[:20]:
+            safe = hashlib.sha256(path.encode()).hexdigest()[:12] + "-" + Path(path).name
+            dest = root / safe
+            dest.mkdir(exist_ok=True)
+            for filename, git, revision in [
+                ("upstream-before", self.upstream, parents[0] if len(parents) == 1 else None),
+                ("upstream-after", self.upstream, sha),
+                ("downstream-HEAD", self.work_git, "HEAD"),
+            ]:
+                if revision:
+                    (dest / filename).write_text(
+                        git.run(["show", f"{revision}:{path}"], check=False)[:262144]
+                    )
+        return root
+
+    def _stop(self, sha: str, reason: str, files: list[str], count: int) -> int:
+        print(f"STOP at {sha[:12]} after {count} attempt(s): {reason}")
+        if files:
+            print("Conflicted files: " + ", ".join(files))
+        dossier = None
+        if reason.startswith("preflight failed:") or reason.startswith("unexpected real-tree cherry-pick failure:"):
+            dossier = self._plan_conflict_dossier(sha, reason, files)
+            print(f"Conflict dossier: {dossier}")
+        if not self.args.dry_run:
+            self.journal["blocked"] = {
+                "sha": sha, "reason": reason, "files": files,
+                "dossier": str(dossier) if dossier else None,
+            }
+            self._write_journal()
+        print("No additional upstream prerequisites were imported automatically.")
+        return 2
+
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1347,10 +1839,19 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         ),
     )
     p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
-    p.add_argument("-c", "--commit", required=True, help="upstream commit SHA")
+    mode = p.add_mutually_exclusive_group(required=True)
+    mode.add_argument("-c", "--commit", help="upstream commit SHA for single-commit mode")
+    mode.add_argument("--plan", help="planner JSON report for bounded TAKE batch execution")
     p.add_argument("-j", "--jira", required=True, help="Jira ID, e.g. RHEL-223619")
     p.add_argument("-l", "--linux-repo", choices=("stable", "next"), default="stable")
-    p.add_argument("--target", required=True, help="upstream target tag/commit, e.g. v7.0")
+    p.add_argument("--target", help="upstream target tag/commit, e.g. v7.0 (required for --commit)")
+    p.add_argument("--max-attempts", type=int, default=1,
+                   help="max TAKE commits attempted per plan invocation (default: 1)")
+    p.add_argument("--resume", action="store_true",
+                   help="resume existing plan execution journal")
+    p.add_argument("--journal", help="override plan execution journal location")
+    p.add_argument("--text-plan", help="original planner text report; default: JSON path with .c suffix")
+    p.add_argument("--progress-output", help="user-chosen progress filename; never overwrite")
     p.add_argument(
         "--repo",
         help="downstream working repository (default: $KERNEL_SRC_DIR, then current directory)",
@@ -1394,12 +1895,29 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--signoff-name")
     p.add_argument("--signoff-email")
     p.add_argument("--debug", action="store_true")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.max_attempts < 1:
+        p.error("--max-attempts must be at least 1")
+    if not args.plan and not args.target:
+        p.error("--target is required in single-commit mode")
+    if not args.plan and (args.resume or args.journal or args.text_plan or
+                          args.progress_output or args.max_attempts != 1):
+        p.error("--resume, --journal, --text-plan, --progress-output and --max-attempts require --plan")
+    if args.text_plan and not args.progress_output:
+        p.error("--text-plan requires --progress-output")
+    if args.dry_run and args.progress_output:
+        p.error("--progress-output is not available with --dry-run")
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = parse_args(argv or sys.argv[1:])
+    args = parse_args(sys.argv[1:] if argv is None else argv)
     print(f"{Path(sys.argv[0]).name} {VERSION}")
+    if args.plan:
+        # A missing --target is resolved by the validated plan after loading.
+        if args.target is None:
+            args.target = BackportPlan.load(args.plan).target
+        return PlannedBackporter(args).run()
     return KernelBackporter(args).run()
 
 

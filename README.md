@@ -14,7 +14,7 @@ The central safety rule is simple:
 > `kernel-backporter` may add known upstream prerequisite commits, but it never
 > edits conflicted source code automatically.
 
-Current version: **0.1.5**
+Current version: **0.2.2**
 
 ## What it does
 
@@ -96,7 +96,7 @@ The tool uses only the Python standard library.
 Install the executable somewhere in `PATH`, for example:
 
 ```bash
-cp kernel-backporter-v0.1.5 ~/bin/kernel-backporter
+cp kernel-backporter ~/bin/kernel-backporter
 chmod 755 ~/bin/kernel-backporter
 ```
 
@@ -109,10 +109,159 @@ kernel-backporter --version
 Expected:
 
 ```text
-kernel-backporter 0.1.5
+kernel-backporter 0.2.2
 ```
 
 Every normal run also prints the version as its first line.
+
+## User-named text-plan progress reports (0.2.2)
+
+Progress reports are opt-in. Supply `--progress-output` with a new destination
+filename on each non-dry-run invocation. The backporter does not choose or
+increment suffixes. Without that argument, no progress copy is written.
+
+First batch:
+
+```bash
+kernel-backporter -j RHEL-223619 \
+    --plan ~/projects/rhel-223619/backport_plan_17.json \
+    --max-attempts 2 \
+    --progress-output ~/projects/rhel-223619/backport_plan_17_2.c
+```
+
+Next batch:
+
+```bash
+kernel-backporter -j RHEL-223619 \
+    --plan ~/projects/rhel-223619/backport_plan_17.json \
+    --resume --max-attempts 2 \
+    --progress-output ~/projects/rhel-223619/backport_plan_17_3.c
+```
+
+The original `.c` and `.json` are untouched. Every progress report is rendered
+from the original text plan, with the authoritative execution journal providing
+`// Done <SHA>`, `// Done (already present)`, `// Review (conflict)`,
+`// Review (prerequisite)`, or `// Review (manual)`. Planner SKIP/REVIEW and
+original evidence remain unchanged.
+
+The destination directory must exist, and existing filenames (including
+symlinks) are never overwritten. An original text report must be present
+alongside the JSON or specified with `--text-plan FILE`. It is checked against
+the JSON order and advisor decisions before backports start. Dry runs cannot
+use `--progress-output` because they do not record execution progress. The
+journal remains authoritative; resetting Git does not reset that journal.
+
+## Plan-driven backports (0.2.0)
+
+Version 0.2.0 introduces a separate, bounded execution mode for JSON output from
+`kernel-backport-planner` 0.4.13 or later. **The planner remains authoritative
+for commit selection**. `kernel-backporter` never selects new dependencies in
+this mode, even if the older single-commit discovery logic could find one.
+
+Produce a human-readable report and matching JSON in a single planner run:
+
+```bash
+kernel-backport-planner ... \
+    --output ~/projects/rhel-223619/backport_plan_17.c \
+    --json-output ~/projects/rhel-223619/backport_plan_17.json
+```
+
+Start on the same clean CS10 tree and at the exact downstream commit recorded in
+`downstream`/`replay_start` in that JSON. For the RHEL-223619 plan:
+
+```bash
+cd ~/projects/rhel-223619/centos-stream-10
+kernel-backporter -j RHEL-223619 \
+    --plan ~/projects/rhel-223619/backport_plan_17.json \
+    --max-attempts 5 --dry-run
+```
+
+When ready to apply a **small, reviewed batch**, omit `--dry-run`:
+
+```bash
+kernel-backporter -j RHEL-223619 \
+    --plan ~/projects/rhel-223619/backport_plan_17.json \
+    --max-attempts 5
+```
+
+Continue from the persisted journal, without touching commits that were already
+completed:
+
+```bash
+kernel-backporter -j RHEL-223619 \
+    --plan ~/projects/rhel-223619/backport_plan_17.json \
+    --max-attempts 5 --resume
+```
+
+`--max-attempts` counts **eligible TAKE attempts**, including a failed preflight,
+not successful commits; its default is one. Policy SKIP and REVIEW entries and
+commits already proven present do not count. There is no special `--commit 0`:
+`--commit SHA` and `--plan FILE` are mutually exclusive. Existing single-commit
+behavior is unchanged.
+
+The executor reads `order` rather than iterating the JSON `commits` dictionary.
+It verifies all ordered entries are selected and missing, the plan's target
+exists, and the **working HEAD matches the frozen plan baseline** on the first
+run. On resume it verifies the journal's plan hash, repository, branch, target,
+and last committed HEAD. It checks explicit advisor prerequisites before each
+TAKE. A missing prerequisite, a SKIP/REVIEW prerequisite, a conflict, an empty
+cherry-pick, or a changed working tree **stops the batch**. It will not silently
+add another upstream prerequisite or edit conflicted files.
+
+All attempted TAKE commits are cherry-picked into one cumulative isolated clone
+first. `--dry-run` simulates the **cumulative** changes, without changing the
+real working tree or journal. A real run preflights each commit, then creates a
+normal downstream-formatted signed-off Git commit. After each success it writes
+an atomic journal under:
+
+```text
+~/backports/kernel-backporter/plans/<plan-name>-<plan-digest>/journal.json
+```
+
+You can override the journal location with `--journal`. Never edit the journal
+manually. Each entry records the upstream SHA, its disposition, and the produced
+downstream SHA when applicable. Running the same plan again without `--resume`
+will refuse to overwrite an existing journal.
+
+### When a batch stops
+
+A preflight conflict never touches the working tree. Investigate the reported
+files, then use the **single-commit** mode or a deliberate manual cherry-pick to
+resolve the blocked commit. If you commit a manual resolution, include the
+exact provenance trailer:
+
+```text
+(cherry picked from commit <full 40-character upstream SHA>)
+```
+
+On `--resume`, one such intervening manually committed resolution is reconciled
+against the blocked upstream SHA. The tool refuses unrelated HEAD changes,
+missing provenance, or multiple unexpected commits. If a real-tree cherry-pick
+unexpectedly conflicts, it leaves the repository for manual inspection rather
+than resetting it. Resolve and commit with provenance before resuming.
+
+The planner's `advisor_prerequisites` are treated as explicit requirements.
+Some recommendations in run 17 reference commits **outside its ordered TAKE
+set**. They will halt plan mode until inspected and resolved. A planner's
+replay-clean label is only an advisory prediction, not a guarantee that a TAKE
+commit will apply or build on the evolving CS10 tree.
+
+### Builds
+
+Version 0.2.0 **does not invoke kernel-builder automatically**. Run it manually
+at a known downstream HEAD after a small batch, and after conflict resolution.
+Record the tested HEAD, architecture/configuration, and build log externally.
+`--check-command` belongs to the existing single-commit workflow and is
+rejected in planned mode. Automatic build checkpoints can be added later without
+coupling the two projects.
+
+### Tests
+
+```bash
+python3 -m unittest -v test_kernel_backporter.py
+```
+
+The test suite uses disposable local Git repositories and does not modify CS10.
 
 ## Typical workflow
 
