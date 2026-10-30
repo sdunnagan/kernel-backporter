@@ -407,5 +407,109 @@ class PlanModeTests(unittest.TestCase):
             self.run_plan("--dry-run")
 
 
+class OptionalTargetTests(unittest.TestCase):
+    """Single-commit implicit target and frozen plan-target regressions."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.up = self.root / "upstream"
+        self.work = self.root / "work"
+        self.up.mkdir()
+        git(self.up, "init", "-b", "main")
+        git(self.up, "config", "user.name", "Test User")
+        git(self.up, "config", "user.email", "test@example.com")
+        (self.up / "base.txt").write_text("initial\n")
+        git(self.up, "add", ".")
+        git(self.up, "commit", "-m", "base")
+        self.base = git(self.up, "rev-parse", "HEAD")
+        (self.up / "one.txt").write_text("one\n")
+        git(self.up, "add", ".")
+        git(self.up, "commit", "-m", "first")
+        self.first = git(self.up, "rev-parse", "HEAD")
+        git(self.root, "clone", "-q", str(self.up), str(self.work))
+        git(self.work, "checkout", "--detach", self.base)
+        git(self.work, "config", "user.name", "Backport User")
+        git(self.work, "config", "user.email", "backport@example.com")
+        self.ds = self.root / "downstream"
+        git(self.root, "clone", "-q", str(self.up), str(self.ds))
+        git(self.ds, "checkout", "-B", "main", self.base)
+
+    def arguments(self, *extra):
+        return ["-j", "RHEL-293896", "-c", self.first,
+                "--repo", str(self.work), "--upstream-url", str(self.up),
+                "--downstream-url", str(self.ds),
+                "--reference-root", str(self.root / "refs"),
+                "--report-dir", str(self.root / "reports"),
+                *extra]
+
+    def reference(self, *extra):
+        args = kb.parse_args(self.arguments(*extra))
+        refs = kb.ReferenceManager(args, kb.Git(self.work))
+        _, _, target, _ = refs.prepare()
+        return args, refs, target
+
+    def test_single_commit_accepts_omitted_target(self):
+        args = kb.parse_args(self.arguments())
+        self.assertIsNone(args.target)
+        args, _, target = self.reference()
+        self.assertEqual(args.target, "refs/remotes/origin/HEAD")
+        self.assertEqual(target, self.first)
+
+    def test_implicit_target_uses_refreshed_tracking_tip_not_stale_local_head(self):
+        _, refs, first_target = self.reference()
+        self.assertEqual(first_target, self.first)
+        local_head = git(refs.upstream_path, "rev-parse", "HEAD")
+        (self.up / "two.txt").write_text("two\n")
+        git(self.up, "add", ".")
+        git(self.up, "commit", "-m", "second")
+        second = git(self.up, "rev-parse", "HEAD")
+        args, refs, target = self.reference()
+        self.assertEqual(target, second)
+        self.assertEqual(git(refs.upstream_path, "rev-parse", "HEAD"), local_head)
+        self.assertEqual(args.target, "refs/remotes/origin/HEAD")
+
+    def test_explicit_target_is_not_replaced(self):
+        args, _, target = self.reference("--target", self.base)
+        self.assertEqual(args.target, self.base)
+        self.assertEqual(target, self.base)
+
+    def test_local_head_fallback_if_remote_head_missing(self):
+        _, refs, _ = self.reference()
+        git(refs.upstream_path, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+        args, refs, target = self.reference("--skip-refresh")
+        self.assertEqual(args.target, "HEAD")
+        self.assertEqual(target, git(refs.upstream_path, "rev-parse", "HEAD"))
+
+    def test_direct_dry_run_without_target_does_not_edit_working_tree(self):
+        original = git(self.work, "rev-parse", "HEAD")
+        self.assertEqual(kb.main(self.arguments("--skip-refresh", "--dry-run", "--no-series")), 0)
+        self.assertEqual(git(self.work, "rev-parse", "HEAD"), original)
+        report = json.loads((self.root / "reports" / self.first / "report.json").read_text())
+        self.assertEqual(report["target"], self.first)
+        self.assertEqual(report["target_name"], "refs/remotes/origin/HEAD")
+
+    def test_explicit_older_target_still_checks_ancestry(self):
+        args = kb.parse_args(self.arguments("--target", self.base, "--skip-refresh"))
+        with self.assertRaisesRegex(kb.KBError, "not an ancestor"):
+            kb.KernelBackporter(args).prepare()
+
+    def test_plan_still_loads_frozen_target(self):
+        payload = {
+            "downstream": self.base, "replay_start": self.base,
+            "target": self.first, "order": [self.first],
+            "commits": {self.first: {
+                "selected": True, "match": {"status": "missing"},
+                "advisor_decision": "TAKE", "advisor_prerequisites": [],
+            }},
+        }
+        plan = self.root / "plan.json"
+        plan.write_text(json.dumps(payload))
+        args = kb.parse_args(["-j", "RHEL-293896", "--plan", str(plan)])
+        self.assertIsNone(args.target)
+        self.assertEqual(kb.BackportPlan.load(args.plan).target, self.first)
+
+
 if __name__ == "__main__":
     unittest.main()

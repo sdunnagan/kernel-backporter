@@ -14,7 +14,7 @@ The central safety rule is simple:
 > `kernel-backporter` may add known upstream prerequisite commits, but it never
 > edits conflicted source code automatically.
 
-Current version: **0.2.2**
+Current version: **0.2.3**
 
 ## What it does
 
@@ -109,7 +109,7 @@ kernel-backporter --version
 Expected:
 
 ```text
-kernel-backporter 0.2.2
+kernel-backporter 0.2.3
 ```
 
 Every normal run also prints the version as its first line.
@@ -272,7 +272,6 @@ kernel-backporter \
     -l stable \
     -j RHEL-223619 \
     -c e7e6902fbd19 \
-    --target v7.0 \
     --dry-run
 ```
 
@@ -283,9 +282,18 @@ If the preflight succeeds and the proposed sequence is correct, rerun without
 kernel-backporter \
     -l stable \
     -j RHEL-223619 \
-    -c e7e6902fbd19 \
-    --target v7.0
+    -c e7e6902fbd19
 ```
+
+In single-commit mode, omitting `--target` selects the fetched upstream
+`origin/HEAD` as the analysis boundary. The local reference checkout's `HEAD`
+may be older than the latest fetched branch, so the remote-tracking HEAD is
+preferred. If it is unavailable, the backporter warns and uses local `HEAD`.
+The selected ref and its resolved SHA are printed and recorded in the report.
+An explicit `--target` still pins the analysis boundary for reproducibility.
+The requested SHA must be reachable from that boundary; otherwise the tool
+stops instead of analyzing unrelated upstream history. In plan mode, the
+planner's JSON target remains authoritative.
 
 A successful dry run ends with output similar to:
 
@@ -541,7 +549,10 @@ upstream-prerequisite replay is no longer sufficient.
     Upstream reference tree. Default: stable.
 
 --target TAG_OR_COMMIT
-    Upstream target boundary, for example v7.0. Required.
+    Optional upstream analysis boundary for single-commit mode, for example
+    v7.3. By default, use the refreshed upstream origin/HEAD (falling back to
+    the local HEAD if no origin/HEAD is available). The resolved SHA is
+    recorded in reports. Plan mode obtains its target from the validated JSON.
 
 --repo PATH
     Downstream working repository. Default: $KERNEL_SRC_DIR, then current directory.

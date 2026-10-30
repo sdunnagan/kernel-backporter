@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
 
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 
 
 HEX40 = r"[0-9a-fA-F]{40}"
@@ -402,6 +402,23 @@ class ReferenceManager:
             dg.run(["clean", "-fd"])
         else:
             print("Reference refresh skipped by request.")
+
+        # In single-commit mode, use the fetched upstream default branch as
+        # the analysis boundary unless the user explicitly pins --target.
+        # The local HEAD of a reference clone may be stale after git fetch;
+        # origin/HEAD tracks the upstream branch without moving that checkout.
+        if self.args.target is None:
+            if self.args.plan:
+                raise KBError("plan mode requires a target from its validated JSON plan")
+            remote_head = "refs/remotes/origin/HEAD"
+            if ug.ok(["rev-parse", "--verify", f"{remote_head}^{{commit}}"]):
+                self.args.target = remote_head
+            else:
+                # Local repositories may have no origin/HEAD (for example,
+                # user-managed references used with --skip-refresh).
+                self.args.target = "HEAD"
+                print("Warning: upstream origin/HEAD is unavailable; using local HEAD. "
+                      "Use --target to pin the analysis boundary.", file=sys.stderr)
 
         target = ug.rev_parse(self.args.target)
         downstream = dg.rev_parse(self.args.downstream_branch)
@@ -1826,11 +1843,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         epilog=textwrap.dedent(
             """\
             Familiar usage:
-              kernel-backporter -l stable -j RHEL-223619 -c 35c3dcb1ac2c --target v7.0
+              kernel-backporter -l stable -j RHEL-223619 -c 35c3dcb1ac2c
 
             Safe first test:
               kernel-backporter -l stable -j RHEL-223619 -c 35c3dcb1ac2c \\
-                  --target v7.0 --dry-run
+                  --dry-run
 
             The tool never edits conflicted source automatically.  It only retries
             by adding known upstream commits and stops when manual source resolution
@@ -1844,7 +1861,9 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     mode.add_argument("--plan", help="planner JSON report for bounded TAKE batch execution")
     p.add_argument("-j", "--jira", required=True, help="Jira ID, e.g. RHEL-223619")
     p.add_argument("-l", "--linux-repo", choices=("stable", "next"), default="stable")
-    p.add_argument("--target", help="upstream target tag/commit, e.g. v7.0 (required for --commit)")
+    p.add_argument("--target", help="optional upstream analysis boundary in single-commit mode "
+                   "(default: upstream origin/HEAD; fallback: HEAD); "
+                   "plan mode uses its JSON target")
     p.add_argument("--max-attempts", type=int, default=1,
                    help="max TAKE commits attempted per plan invocation (default: 1)")
     p.add_argument("--resume", action="store_true",
@@ -1898,8 +1917,6 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     args = p.parse_args(argv)
     if args.max_attempts < 1:
         p.error("--max-attempts must be at least 1")
-    if not args.plan and not args.target:
-        p.error("--target is required in single-commit mode")
     if not args.plan and (args.resume or args.journal or args.text_plan or
                           args.progress_output or args.max_attempts != 1):
         p.error("--resume, --journal, --text-plan, --progress-output and --max-attempts require --plan")
