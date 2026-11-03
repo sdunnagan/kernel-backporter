@@ -14,7 +14,7 @@ The central safety rule is simple:
 > `kernel-backporter` may add known upstream prerequisite commits, but it never
 > edits conflicted source code automatically.
 
-Current version: **0.2.3**
+Current version: **0.2.4**
 
 ## What it does
 
@@ -109,10 +109,56 @@ kernel-backporter --version
 Expected:
 
 ```text
-kernel-backporter 0.2.3
+kernel-backporter 0.2.4
 ```
 
 Every normal run also prints the version as its first line.
+
+## Read-only plan status (0.2.4)
+
+Use `--status` with `--plan` to inspect journal progress **without**
+fetching/updating references, indexing the kernel tree, changing Git, or
+writing a journal or progress report. Jira is optional for this command.
+Run it from the intended downstream kernel repository (or pass `--repo`).
+
+```bash
+cd ~/projects/rhel-223619/centos-stream-10
+PLAN_ROOT="$HOME/Documents/red_hat_notes/tasks/305_arm_rebase_upstream_v7"
+kernel-backporter --plan \
+    "$PLAN_ROOT/backport_plan_28/backport_plan_28.json" --status
+```
+
+Status displays total TAKE and SKIP/REVIEW entries, journal cursor,
+recorded applied/present/skipped counts, remaining TAKE commits, the next
+TAKE commit, blocked state, and recorded versus actual Git HEAD. It loads
+only the plan, journal, and local Git metadata. `--journal FILE` can select a
+nonstandard journal path. `--status` cannot be combined with execution flags.
+It exits 0 for a readable, consistent state (including a recorded blocker),
+2 for mismatched HEAD or dirty worktree, and 1 for a corrupt or mismatched
+journal.
+
+**Important after `git reset --hard`:** Git reset does not reset the
+backporter's journal. If the journal records six applied commits but the
+branch has returned to the plan baseline, `--status` reports `DIVERGED` and
+explicitly warns that those recorded commits are **not verified** on the
+current branch. Neither normal execution nor `--resume` can reuse that stale
+journal. The status command never deletes, rewrites, or reconciles it.
+
+To replay the same plan from scratch, first verify that the working HEAD is
+exactly the plan baseline and the tree is clean; then **archive** the stale
+journal under a distinct name before starting a new batch. For example:
+
+```bash
+journal="$HOME/backports/kernel-backporter/plans/"\
+"backport_plan_28-548db77a06c1/journal.json"
+test -f "$journal" || exit 1
+test ! -e "$journal.before-reset" || exit 1
+mv -- "$journal" "$journal.before-reset"
+```
+
+This is an explicit user action, not something `--status` performs. Preserve
+archived journals for historical provenance. The next real invocation will
+create a new journal for the same plan and current repository.
 
 ## User-named text-plan progress reports (0.2.2)
 

@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
 
-VERSION = "0.2.3"
+VERSION = "0.2.4"
 
 
 HEX40 = r"[0-9a-fA-F]{40}"
@@ -347,7 +347,6 @@ class ReferenceManager:
         self.args = args
         self.work_git = work_git
         self.root = Path(args.reference_root).expanduser().resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
         self.upstream_path = self.root / ("linux-stable" if args.linux_repo == "stable" else "linux-next")
         self.downstream_path = self.root / "cs10"
 
@@ -383,6 +382,7 @@ class ReferenceManager:
             raise KBError(f"failed to clone {label} reference from {url}")
 
     def prepare(self) -> tuple[Git, Git, str, str]:
+        self.root.mkdir(parents=True, exist_ok=True)
         upstream_url = self._discover_upstream_url()
         downstream_url = self._discover_downstream_url()
         self._clone_if_missing(self.upstream_path, upstream_url, "upstream")
@@ -1652,6 +1652,135 @@ class PlannedBackporter(KernelBackporter):
         if self.current_ds_head != self.batch_plan.baseline:
             print("NOTE: official CS10 has advanced since the plan; the working baseline is unchanged")
 
+    def status(self) -> int:
+        """Report recorded progress against live Git without changing state.
+
+        Do not refresh reference repositories, index millions of commits, or
+        reconcile the journal here. A Git reset is not a journal reset.
+        """
+        plan = self.batch_plan
+        actual = self.work_git.rev_parse("HEAD")
+        expected = self._new_journal()
+        take = sum(plan.commits[sha]["advisor_decision"] == "TAKE"
+                   for sha in plan.order)
+        skipped = len(plan.order) - take
+        print(f"Plan: {plan.path}")
+        print(f"Plan SHA256: {plan.digest}")
+        print(f"Baseline: {plan.baseline}")
+        print(f"Working HEAD: {actual}")
+        print(f"Journal: {self.journal_path}")
+        print(f"Planned: {take} TAKE, {skipped} SKIP/REVIEW "
+              f"({len(plan.order)} ordered entries)")
+
+        if not self.journal_path.is_file():
+            print("Status: NOT STARTED (no execution journal)")
+            print(f"Recorded: 0 applied, 0 already present, "
+                  f"0 policy skipped; {take} TAKE pending")
+            if actual != plan.baseline:
+                print("WARNING: working HEAD does not match the plan baseline; "
+                      "new execution would be refused")
+                return 2
+            if not self.work_git.status_clean():
+                print("WARNING: working tree is not clean")
+                return 2
+            return 0
+
+        try:
+            journal = json.loads(self.journal_path.read_text())
+        except (OSError, ValueError) as exc:
+            raise KBError(f"cannot read status journal: {exc}") from exc
+        if not isinstance(journal, dict):
+            raise KBError("journal must be a JSON object")
+        for field in ("schema_version", "plan_sha256", "repo", "branch",
+                      "baseline", "target"):
+            if journal.get(field) != expected[field]:
+                raise KBError(f"journal {field} differs from this "
+                              "plan/repository; refusing progress claim")
+        entries = journal.get("entries")
+        cursor = journal.get("cursor")
+        if (not isinstance(cursor, int) or isinstance(cursor, bool)
+                or not 0 <= cursor <= len(plan.order)
+                or not isinstance(entries, list)
+                or len(entries) != cursor):
+            raise KBError("journal entries/cursor are inconsistent")
+        valid = {"APPLIED", "APPLIED_MANUALLY", "ALREADY_PRESENT",
+                 "SKIPPED_POLICY"}
+        for position, entry in enumerate(entries):
+            if (not isinstance(entry, dict)
+                    or entry.get("sha") != plan.order[position]
+                    or entry.get("status") not in valid):
+                raise KBError("journal entry order/status is invalid at "
+                              f"position {position + 1}")
+            if entry["status"] in ("APPLIED", "APPLIED_MANUALLY"):
+                sha = entry.get("downstream_sha")
+                if not isinstance(sha, str) or not SHA40_RE.fullmatch(sha):
+                    raise KBError("journal APPLIED entry lacks downstream SHA")
+        blocked = journal.get("blocked")
+        if blocked is not None:
+            if (not isinstance(blocked, dict) or cursor >= len(plan.order)
+                    or blocked.get("sha") != plan.order[cursor]):
+                raise KBError("journal blocked entry does not match cursor")
+        recorded = journal.get("last_head")
+        if not isinstance(recorded, str) or not SHA40_RE.fullmatch(recorded):
+            raise KBError("journal last_head is invalid")
+        last_applied = next(
+            (entry["downstream_sha"] for entry in reversed(entries)
+             if entry["status"] in ("APPLIED", "APPLIED_MANUALLY")),
+            plan.baseline,
+        )
+        if recorded != last_applied:
+            raise KBError("journal last_head differs from recorded applied "
+                          "commit")
+
+        applied = sum(e["status"] in ("APPLIED", "APPLIED_MANUALLY")
+                      for e in entries)
+        present = sum(e["status"] == "ALREADY_PRESENT" for e in entries)
+        policy = sum(e["status"] == "SKIPPED_POLICY" for e in entries)
+        remaining = sum(plan.commits[sha]["advisor_decision"] == "TAKE"
+                        for sha in plan.order[cursor:])
+        print(f"Journal cursor: {cursor}/{len(plan.order)}")
+        print(f"Recorded: {applied} applied, {present} already present, "
+              f"{policy} policy skipped; {remaining} TAKE pending")
+        print(f"Journal HEAD: {recorded}")
+        recent = [entry for entry in entries
+                  if entry["status"] in ("APPLIED", "APPLIED_MANUALLY")]
+        if recent:
+            print("Recent recorded applications:")
+            for entry in recent[-6:]:
+                sha = entry["sha"]
+                downstream = entry["downstream_sha"]
+                print(f"  {sha[:12]} -> {downstream[:12]} "
+                      f"{plan.commits[sha].get('subject', '')}")
+        if blocked:
+            print(f"Blocked: {blocked['sha'][:12]}: "
+                  f"{blocked.get('reason', 'unknown reason')}")
+        next_take = next(
+            (sha for sha in plan.order[cursor:]
+             if plan.commits[sha]["advisor_decision"] == "TAKE"), None)
+        if next_take:
+            print(f"Next TAKE: {next_take[:12]} "
+                  f"{plan.commits[next_take].get('subject', '')}")
+
+        if actual != recorded:
+            if self.work_git.is_ancestor(recorded, actual):
+                print("Status: HEAD ADVANCED beyond journal "
+                      "(manual reconciliation required)")
+            else:
+                print("Status: DIVERGED; recorded backports are NOT "
+                      "verified on the current HEAD")
+                if actual == plan.baseline:
+                    print("Git is at the plan baseline, consistent with a "
+                          "hard reset; the old journal still records work")
+            print("Do not use --resume or start a new run with this journal. "
+                  "Archive the stale journal explicitly before replaying.")
+            return 2
+        if not self.work_git.status_clean():
+            print("Status: DIRTY WORKTREE (journal HEAD matches, "
+                  "but execution cannot continue)")
+            return 2
+        print("Status: BLOCKED" if blocked else "Status: IN SYNC")
+        return 0
+
     def _present(self, sha: str, applied: set[str]) -> bool:
         if sha in applied:
             return True
@@ -1859,7 +1988,9 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     mode = p.add_mutually_exclusive_group(required=True)
     mode.add_argument("-c", "--commit", help="upstream commit SHA for single-commit mode")
     mode.add_argument("--plan", help="planner JSON report for bounded TAKE batch execution")
-    p.add_argument("-j", "--jira", required=True, help="Jira ID, e.g. RHEL-223619")
+    p.add_argument("-j", "--jira", help="Jira ID, e.g. RHEL-223619")
+    p.add_argument("--status", action="store_true",
+                   help="read-only plan progress and Git/journal consistency")
     p.add_argument("-l", "--linux-repo", choices=("stable", "next"), default="stable")
     p.add_argument("--target", help="optional upstream analysis boundary in single-commit mode "
                    "(default: upstream origin/HEAD; fallback: HEAD); "
@@ -1915,6 +2046,17 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--signoff-email")
     p.add_argument("--debug", action="store_true")
     args = p.parse_args(argv)
+    if not args.status and not args.jira:
+        p.error("-j/--jira is required except with --status")
+    if args.status:
+        if not args.plan:
+            p.error("--status requires --plan")
+        if (args.resume or args.dry_run or args.progress_output
+                or args.text_plan or args.check_command
+                or args.max_attempts != 1):
+            p.error("--status is read-only; cannot combine with --resume, "
+                    "--dry-run, --progress-output, --text-plan, "
+                    "--check-command, or --max-attempts")
     if args.max_attempts < 1:
         p.error("--max-attempts must be at least 1")
     if not args.plan and (args.resume or args.journal or args.text_plan or
@@ -1934,7 +2076,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         # A missing --target is resolved by the validated plan after loading.
         if args.target is None:
             args.target = BackportPlan.load(args.plan).target
-        return PlannedBackporter(args).run()
+        executor = PlannedBackporter(args)
+        return executor.status() if args.status else executor.run()
     return KernelBackporter(args).run()
 
 

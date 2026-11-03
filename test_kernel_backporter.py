@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Bounded plan execution integration tests using isolated local Git repos."""
+import contextlib
 import importlib.machinery
+import io
 import importlib.util
 import json
 import subprocess
@@ -88,6 +90,114 @@ class PlanModeTests(unittest.TestCase):
 
     def journals(self):
         return list((self.root / "reports").rglob("journal.json"))
+
+    def status_output(self, *extra):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = kb.main(self.args("--status", *extra))
+        return result, output.getvalue()
+
+    def test_status_before_first_run_is_read_only_and_fast(self):
+        result, output = self.status_output()
+        self.assertEqual(result, 0)
+        self.assertIn("NOT STARTED", output)
+        self.assertIn("3 TAKE pending", output)
+        self.assertFalse(self.journals())
+        # Status must not even create or refresh reference repositories.
+        self.assertFalse((self.root / "refs").exists())
+        self.assertEqual(git(self.work, "rev-parse", "HEAD"), self.base)
+
+    def test_status_after_apply_and_resume(self):
+        self.assertEqual(self.run_plan("--max-attempts", "2"), 0)
+        journal = self.journals()[0]
+        original = journal.read_bytes()
+        result, output = self.status_output()
+        self.assertEqual(result, 0)
+        self.assertIn("Status: IN SYNC", output)
+        self.assertIn("2 applied", output)
+        self.assertIn("Recent recorded applications:", output)
+        self.assertIn(f"{self.a[:12]} ->", output)
+        self.assertIn("1 TAKE pending", output)
+        self.assertIn(f"Next TAKE: {self.c[:12]}", output)
+        self.assertEqual(journal.read_bytes(), original)
+        self.assertEqual(self.run_plan("--resume"), 0)
+        result, output = self.status_output()
+        self.assertEqual(result, 0)
+        self.assertIn("3 applied", output)
+        self.assertIn("0 TAKE pending", output)
+
+    def test_status_hard_reset_requires_new_journal(self):
+        self.assertEqual(self.run_plan("--max-attempts", "2"), 0)
+        journal = self.journals()[0]
+        old = journal.read_bytes()
+        git(self.work, "reset", "--hard", self.base)
+        result, output = self.status_output()
+        self.assertEqual(result, 2)
+        self.assertIn("Status: DIVERGED", output)
+        self.assertIn("2 applied", output)
+        self.assertIn("NOT verified", output)
+        self.assertIn("hard reset", output)
+        self.assertEqual(journal.read_bytes(), old)
+        self.assertEqual(git(self.work, "rev-parse", "HEAD"), self.base)
+        with self.assertRaisesRegex(kb.KBError, "journal already exists"):
+            self.run_plan()
+        with self.assertRaisesRegex(kb.KBError, "working HEAD differs"):
+            self.run_plan("--resume")
+        journal.rename(journal.with_suffix(".json.archived"))
+        result, output = self.status_output()
+        self.assertEqual(result, 0)
+        self.assertIn("NOT STARTED", output)
+        self.assertEqual(self.run_plan("--max-attempts", "2"), 0)
+        result, output = self.status_output()
+        self.assertEqual(result, 0)
+        self.assertIn("2 applied", output)
+
+    def test_status_blocked_plan_and_policy_skips(self):
+        self.build_plan(decisions={self.b: "REVIEW"},
+                        prereqs={self.c: [self.b]})
+        self.assertEqual(self.run_plan("--max-attempts", "3"), 2)
+        result, output = self.status_output()
+        self.assertEqual(result, 0)
+        self.assertIn("Status: BLOCKED", output)
+        self.assertIn("1 applied", output)
+        self.assertIn("1 policy skipped", output)
+        self.assertIn("Blocked:", output)
+        self.assertIn("1 TAKE pending", output)
+
+    def test_status_rejects_bad_journal_identity_or_entries(self):
+        self.assertEqual(self.run_plan(), 0)
+        journal = self.journals()[0]
+        original = json.loads(journal.read_text())
+        for field, value in (("repo", "/unrelated/tree"),
+                             ("plan_sha256", "0" * 64),
+                             ("cursor", 2),
+                             ("last_head", self.base)):
+            with self.subTest(field=field):
+                mutated = {**original, field: value}
+                journal.write_text(json.dumps(mutated))
+                with self.assertRaises(kb.KBError):
+                    self.status_output()
+        journal.write_text(json.dumps(original))
+        self.assertEqual(self.status_output()[0], 0)
+
+    def test_status_checks_dirty_worktree_and_incompatible_options(self):
+        (self.work / "untracked").write_text("untracked\n")
+        result, output = self.status_output()
+        self.assertEqual(result, 2)
+        self.assertIn("not clean", output)
+        (self.work / "untracked").unlink()
+        for option in (("--resume",), ("--dry-run",),
+                       ("--max-attempts", "2"),
+                       ("--progress-output", str(self.root / "out.c"))):
+            with self.subTest(option=option):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as caught:
+                        kb.parse_args(self.args("--status", *option))
+                self.assertEqual(caught.exception.code, 2)
+        self.assertEqual(kb.parse_args(self.args("--status")).status, True)
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(io.StringIO()):
+                kb.parse_args(["--plan", str(self.planfile)])
 
     def test_actual_bounded_apply_and_resume(self):
         self.assertEqual(self.run_plan("--max-attempts", "2"), 0)
