@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import collections
 import dataclasses
+import hashlib
 import datetime as dt
 import json
 import os
@@ -33,11 +34,12 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import zipfile
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
 
-VERSION = "0.2.4"
+VERSION = "0.2.7"
 
 
 HEX40 = r"[0-9a-fA-F]{40}"
@@ -109,6 +111,104 @@ def default_reference_root() -> str:
 
 class KBError(RuntimeError):
     pass
+
+
+# Kernel-builder and kernel-backport-planner use these Freedesktop sounds too.
+# Audio notification is deliberately best-effort and never affects exit status.
+BACKPORTER_SOUND_DIR = "/usr/share/sounds/freedesktop/stereo"
+
+
+def play_backporter_completion_sound(success: bool) -> None:
+    """Play a single completion/failure sound for an execution attempt."""
+    filename = "complete.oga" if success else "service-logout.oga"
+    directory = os.environ.get("KBB_SOUND_DIR", BACKPORTER_SOUND_DIR)
+    sound = Path(directory).expanduser() / filename
+    try:
+        if not sound.is_file():
+            return
+        for player, options in (
+            ("canberra-gtk-play", ["-f", str(sound)]),
+            ("pw-play", [str(sound)]),
+            ("paplay", [str(sound)]),
+        ):
+            program = shutil.which(player)
+            if not program:
+                continue
+            try:
+                result = subprocess.run(
+                    [program, *options], stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, timeout=10, check=False,
+                )
+                if result.returncode == 0:
+                    return
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+    except OSError:
+        pass
+
+
+def latest_completed_plan_directory(workspace: str | Path) -> Path:
+    """Select the highest-numbered completed planning cycle in a workspace.
+
+    A sibling ZIP is the planner's completion marker. Incomplete higher
+    numbered runs are skipped; neither a partial JSON nor a worksheet alone
+    is sufficient. Never choose a plan by modification time or lexical order.
+    """
+    root = Path(workspace).expanduser().resolve()
+    directory = root / "backport-plans"
+    if not directory.is_dir() or directory.is_symlink():
+        raise KBError(f"no planner results directory: {directory}")
+    candidates: list[tuple[int, Path]] = []
+    for child in directory.iterdir():
+        match = re.fullmatch(r"backport_plan_(\d+)", child.name)
+        if match and child.is_dir() and not child.is_symlink():
+            candidates.append((int(match.group(1)), child))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    for _, child in candidates:
+        plan = child / "backport_plan.json"
+        worksheet = child / "backport_worksheet.txt"
+        archive = child.with_suffix(".zip")
+        if not all(path.is_file() and not path.is_symlink()
+                   for path in (plan, worksheet, archive)):
+            continue
+        try:
+            # Opening the archive's central directory is cheap even when it
+            # contains a large advisor trace. No decompression is necessary.
+            with zipfile.ZipFile(archive) as zipped:
+                zipped.getinfo(f"{child.name}/backport_plan.json")
+                zipped.getinfo(f"{child.name}/backport_worksheet.txt")
+            with plan.open("r", encoding="utf-8") as stream:
+                if not isinstance(json.load(stream), dict):
+                    continue
+        except (OSError, ValueError, KeyError, zipfile.BadZipFile):
+            continue
+        return child.resolve()
+    raise KBError(
+        f"no completed planner run in {directory}; expected "
+        "backport_plan_N/backport_plan.json, backport_worksheet.txt, "
+        "and the sibling backport_plan_N.zip. Use --results-dir to "
+        "select a nonstandard or older plan explicitly."
+    )
+
+
+def default_downstream_repo() -> str:
+    """Derive the normal kernel source directory from the shared workspace."""
+    workspace = os.environ.get("KERNEL_WORKSPACE_DIR")
+    if workspace:
+        root = Path(workspace).expanduser().resolve()
+        cs_version = os.environ.get("CS_VERSION")
+        if cs_version:
+            return str(root / f"centos-stream-{cs_version}")
+        matches = sorted(path for path in root.glob("centos-stream-*")
+                         if path.is_dir())
+        if len(matches) == 1:
+            return str(matches[0])
+        if len(matches) > 1:
+            raise KBError(
+                f"multiple CentOS Stream trees under {root}; set "
+                "CS_VERSION or use --repo"
+            )
+    return os.environ.get("KERNEL_SRC_DIR") or "."
 
 
 class Git:
@@ -428,7 +528,7 @@ class ReferenceManager:
 class KernelBackporter:
     def __init__(self, args: argparse.Namespace):
         self.args = args
-        repo = args.repo or os.environ.get("KERNEL_SRC_DIR") or "."
+        repo = args.repo or default_downstream_repo()
         self.repo = Path(repo).expanduser().resolve()
         self.work_git = Git(self.repo, args.debug)
         if not (self.repo / ".git").exists() and not self.work_git.ok(["rev-parse", "--git-dir"]):
@@ -1491,6 +1591,148 @@ class PlanTextProgress:
             Path(temporary).unlink(missing_ok=True)
 
 
+class BackportWorksheet:
+    """Maintain a live engineer-editable worksheet from journal state.
+
+    The JSON plan, not worksheet annotations, controls the execution order.
+    Only the status field of a recognized commit header and the immediately
+    adjacent machine-owned blocker line may be changed. All other text is
+    preserved, including annotations inserted by the engineer.
+    """
+
+    HEADER_RE = re.compile(
+        r'^(?P<prefix>[0-9a-f]{12} (?:\[[^\]\n]+\] )?\(.*?\) )'
+        r'// (?P<status>Take|Skip|Review(?: \([^\n)]*\))?|'
+        r'Done(?: [0-9a-f]{12,40}| \(already present\)))$'
+    )
+    MANAGED_RE = re.compile(r"^      backporter: BLOCKED (.*)$")
+
+    def __init__(self, filename: str, plan: BackportPlan):
+        # Refuse symlinks rather than following them into an unrelated file.
+        path = Path(os.path.abspath(Path(filename).expanduser()))
+        if path.is_symlink() or not path.is_file():
+            raise KBError(f"worksheet must be an existing regular file: {path}")
+        if path.resolve() == plan.path or not path.parent.is_dir():
+            raise KBError("worksheet must be separate from the immutable JSON plan")
+        self.path = path
+        self.plan = plan
+        self._read_validated()
+
+    def _read_validated(self) -> tuple[bytes, list[str]]:
+        if self.path.is_symlink() or not self.path.is_file():
+            raise KBError(f"worksheet is missing or a symlink: {self.path}")
+        try:
+            raw = self.path.read_bytes()
+            text = raw.decode("utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise KBError(f"cannot read worksheet {self.path}: {exc}") from exc
+        lines = text.splitlines(keepends=True)
+        matches = [self.HEADER_RE.fullmatch(line.rstrip("\r\n"))
+                   for line in lines]
+        found = [match for match in matches if match]
+        actual = [match.group("prefix")[:12] for match in found]
+        expected = [sha[:12] for sha in self.plan.order]
+        if actual != expected:
+            raise KBError(
+                f"worksheet entries do not match plan JSON order "
+                f"({len(actual)} worksheet entries versus "
+                f"{len(expected)} ordered commits): {self.path}"
+            )
+        for match, sha in zip(found, self.plan.order):
+            original = self.plan.commits[sha]["advisor_decision"].capitalize()
+            # A live worksheet can already have machine-generated status.
+            status = match.group("status")
+            if status in ("Take", "Skip", "Review") and status != original:
+                raise KBError(f"worksheet decision for {sha[:12]} contradicts "
+                              "the immutable plan JSON")
+        return raw, lines
+
+    @staticmethod
+    def _blocked_line(blocked: dict | None, sha: str) -> str | None:
+        if not blocked or blocked.get("sha") != sha:
+            return None
+        reason = " ".join(str(blocked.get("reason", "unknown")).split())
+        reason = reason[:500]
+        files = blocked.get("files") or []
+        details = f"; files={','.join(str(x) for x in files[:12])}" if files else ""
+        dossier = blocked.get("dossier")
+        if dossier:
+            details += f"; dossier={dossier}"
+        return f"      backporter: BLOCKED {reason}{details}"
+
+    def render(self, journal: dict, lines: list[str]) -> str:
+        entries = {entry["sha"]: entry for entry in journal["entries"]}
+        blocked = journal.get("blocked")
+        out = []
+        cursor = 0
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            match = self.HEADER_RE.fullmatch(line.rstrip("\r\n"))
+            if not match:
+                out.append(line)
+                i += 1
+                continue
+            sha = self.plan.order[cursor]
+            cursor += 1
+            entry = entries.get(sha)
+            status = self.plan.commits[sha]["advisor_decision"].capitalize()
+            if entry and entry["status"] in ("APPLIED", "APPLIED_MANUALLY"):
+                downstream = entry.get("downstream_sha")
+                if not isinstance(downstream, str) or not SHA40_RE.fullmatch(downstream):
+                    raise KBError(f"journal missing downstream SHA for {sha}")
+                status = "Done " + downstream[:12]
+            elif entry and entry["status"] == "ALREADY_PRESENT":
+                status = "Done (already present)"
+            elif blocked and blocked.get("sha") == sha:
+                reason = str(blocked.get("reason", ""))
+                status = PlanTextProgress._review_reason(reason)
+            # Preserve existing newline style and all unrelated text.
+            newline = "\r\n" if line.endswith("\r\n") else (
+                "\n" if line.endswith("\n") else "")
+            out.append(match.group("prefix") + "// " + status + newline)
+            i += 1
+            # This one line is machine-owned; all other annotations are opaque.
+            if i < len(lines) and self.MANAGED_RE.fullmatch(lines[i].rstrip("\r\n")):
+                i += 1
+            note = self._blocked_line(blocked, sha)
+            if note:
+                out.append(note + (newline or "\n"))
+        return "".join(out)
+
+    def synchronize(self, journal: dict) -> bool:
+        """Atomically publish validated status changes; preserve manual edits.
+
+        If the engineer changes the worksheet during preparation, refuse to
+        overwrite the concurrent edit. The next invocation will resync.
+        """
+        import hashlib
+        import stat
+
+        raw, lines = self._read_validated()
+        updated = self.render(journal, lines).encode("utf-8")
+        if updated == raw:
+            return False
+        original_hash = hashlib.sha256(raw).digest()
+        mode = stat.S_IMODE(self.path.stat().st_mode)
+        fd, temporary = tempfile.mkstemp(prefix=".backport-worksheet-",
+                                          dir=self.path.parent)
+        try:
+            with os.fdopen(fd, "wb") as output:
+                os.fchmod(output.fileno(), mode)
+                output.write(updated)
+                output.flush()
+                os.fsync(output.fileno())
+            if (self.path.is_symlink() or not self.path.is_file()
+                    or hashlib.sha256(self.path.read_bytes()).digest() != original_hash):
+                raise KBError("worksheet changed during update; refusing to "
+                              f"overwrite engineer edits: {self.path}")
+            os.replace(temporary, self.path)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+        return True
+
+
 class PlannedBackporter(KernelBackporter):
     """Conservative bounded execution of an explicit planner TAKE sequence.
 
@@ -1503,14 +1745,43 @@ class PlannedBackporter(KernelBackporter):
         self.batch_plan = BackportPlan.load(args.plan)
         # Keep journals separate across plan versions AND across different trees.
         # The journal itself checks canonical repository identity.
+        # Generic plan filenames are reused in every planning cycle. Use
+        # the numbered parent directory to keep journals distinct even when
+        # two planning runs produce byte-identical JSON plans.
+        plan_name = self.batch_plan.path.stem
+        if (plan_name == "backport_plan"
+                and re.fullmatch(r"backport_plan_\d+",
+                                 self.batch_plan.path.parent.name)):
+            # Keep same-numbered/digested cycles in separate workspaces
+            # independent, even when they share a downstream repository.
+            identity = str(self.batch_plan.path.parent) + "\n" + str(self.repo)
+            cycle_key = hashlib.sha256(identity.encode()).hexdigest()[:8]
+            plan_name = self.batch_plan.path.parent.name + "-" + cycle_key
         self.state_dir = self.report_root / "plans" / (
-            self.batch_plan.path.stem + "-" + self.batch_plan.digest[:12]
+            plan_name + "-" + self.batch_plan.digest[:12]
         )
         self.journal_path = (Path(args.journal).expanduser().resolve()
                              if args.journal else self.state_dir / "journal.json")
+        # 0.2.5 keyed generic filenames only by their JSON digest. Reuse an
+        # existing older journal ONLY when it explicitly names this same plan
+        # path. Do not accidentally borrow another cycle's identical plan.
+        if not args.journal and plan_name != self.batch_plan.path.stem:
+            legacy = (self.report_root / "plans" /
+                      ("backport_plan-" + self.batch_plan.digest[:12]) /
+                      "journal.json")
+            if not self.journal_path.exists() and legacy.is_file():
+                try:
+                    previous = json.loads(legacy.read_text())
+                except (OSError, ValueError):
+                    previous = None
+                if (isinstance(previous, dict)
+                        and previous.get("plan_path") == str(self.batch_plan.path)
+                        and previous.get("repo") == str(self.repo)):
+                    self.journal_path = legacy
         self.journal: dict = {}
         self.text_progress: PlanTextProgress | None = None
         self.progress_output: Path | None = None
+        self.worksheet: BackportWorksheet | None = None
         self.work_index: ProvenanceIndex
 
     def _new_journal(self) -> dict:
@@ -1540,26 +1811,143 @@ class PlannedBackporter(KernelBackporter):
             os.replace(tmp, self.journal_path)
         finally:
             Path(tmp).unlink(missing_ok=True)
+        # The journal is committed before the worksheet. If the latter cannot
+        # be written, the next invocation can recover the live worksheet.
+        if self.worksheet is not None:
+            self.worksheet.synchronize(self.journal)
 
-    def _load_journal(self) -> None:
-        if self.args.resume:
-            try:
-                self.journal = json.loads(self.journal_path.read_text())
-            except (OSError, ValueError) as exc:
-                raise KBError(f"cannot resume: journal unavailable or corrupt: {exc}") from exc
-            expected = self._new_journal()
-            for field in ("schema_version", "plan_sha256", "repo", "branch", "baseline", "target"):
-                if self.journal.get(field) != expected[field]:
-                    raise KBError(f"journal {field} differs from this plan/repository")
-            cursor = self.journal.get("cursor")
-            if not isinstance(cursor, int) or not 0 <= cursor <= len(self.batch_plan.order):
-                raise KBError("journal cursor is invalid")
-            if not isinstance(self.journal.get("entries"), list):
-                raise KBError("journal entries are invalid")
-        else:
-            if self.journal_path.exists():
-                raise KBError(f"execution journal already exists; use --resume: {self.journal_path}")
+    def _validate_journal(self, journal: dict) -> None:
+        """Reject corrupt or mismatched progress before skipping plan entries.
+
+        The worksheet is never trusted for execution state. Validate every
+        journal entry, not just its cursor, before automatically continuing.
+        """
+        if not isinstance(journal, dict):
+            raise KBError("execution journal is not a JSON object")
+        expected = self._new_journal()
+        for field in ("schema_version", "plan_sha256", "plan_path", "repo",
+                      "branch", "baseline", "target"):
+            if journal.get(field) != expected[field]:
+                raise KBError(
+                    f"journal {field} differs from this plan/repository")
+        entries = journal.get("entries")
+        cursor = journal.get("cursor")
+        if (not isinstance(cursor, int) or isinstance(cursor, bool)
+                or not 0 <= cursor <= len(self.batch_plan.order)
+                or not isinstance(entries, list) or len(entries) != cursor):
+            raise KBError("journal entries/cursor are inconsistent")
+        valid = {"APPLIED", "APPLIED_MANUALLY", "ALREADY_PRESENT",
+                 "SKIPPED_POLICY"}
+        for position, entry in enumerate(entries):
+            if (not isinstance(entry, dict)
+                    or entry.get("sha") != self.batch_plan.order[position]
+                    or entry.get("status") not in valid):
+                raise KBError("journal entry order/status is invalid at "
+                              f"position {position + 1}")
+            if entry["status"] in ("APPLIED", "APPLIED_MANUALLY"):
+                sha = entry.get("downstream_sha")
+                if not isinstance(sha, str) or not SHA40_RE.fullmatch(sha):
+                    raise KBError("journal APPLIED entry lacks downstream SHA")
+        blocked = journal.get("blocked")
+        if blocked is not None:
+            if (not isinstance(blocked, dict) or cursor >= len(self.batch_plan.order)
+                    or blocked.get("sha") != self.batch_plan.order[cursor]):
+                raise KBError("journal blocked entry does not match cursor")
+        recorded = journal.get("last_head")
+        if not isinstance(recorded, str) or not SHA40_RE.fullmatch(recorded):
+            raise KBError("journal last_head is invalid")
+        last_applied = next(
+            (entry["downstream_sha"] for entry in reversed(entries)
+             if entry["status"] in ("APPLIED", "APPLIED_MANUALLY")),
+            self.batch_plan.baseline,
+        )
+        if recorded != last_applied:
+            raise KBError("journal last_head differs from recorded applied "
+                          "commit")
+
+    def _load_journal(self) -> bool:
+        """Load valid progress if present, or prepare a fresh session.
+
+        Returns True for an existing journal. Never reset or overwrite a
+        journal simply because a command is repeated.
+        """
+        if not self.journal_path.exists():
             self.journal = self._new_journal()
+            return False
+        try:
+            self.journal = json.loads(self.journal_path.read_text())
+        except (OSError, ValueError) as exc:
+            raise KBError(f"cannot read existing journal: {exc}") from exc
+        self._validate_journal(self.journal)
+        return True
+
+    def _guard_unfinished_prior_cycles(self) -> None:
+        """Do not auto-select a new cycle while another is still unfinished.
+
+        Only journals for an earlier cycle in the same workspace, repository,
+        and checked-out branch are relevant. Explicit --results-dir/--plan is
+        the deliberate override, e.g. after establishing a new MR baseline.
+        """
+        if not getattr(self.args, "auto_selected", False):
+            return
+        # A journal for the newest cycle means it was already chosen, perhaps
+        # explicitly with --results-dir after an MR changed the baseline.
+        # The loader still validates that journal before continuing.
+        if self.journal_path.is_file():
+            return
+        selected = self.batch_plan.path.parent
+        if not re.fullmatch(r"backport_plan_\d+", selected.name):
+            return
+        root = selected.parent
+        if root.name != "backport-plans":
+            return
+        current_number = int(selected.name.rsplit("_", 1)[1])
+        branch = self.work_git.run(
+            ["symbolic-ref", "--short", "HEAD"], check=False).strip() or "DETACHED"
+        journal_root = self.report_root / "plans"
+        if not journal_root.is_dir():
+            return
+        unfinished = set()
+        for journal_path in journal_root.glob("*/journal.json"):
+            if journal_path.is_symlink() or not journal_path.is_file():
+                continue
+            try:
+                data = json.loads(journal_path.read_text())
+                if not isinstance(data, dict):
+                    continue
+                if (data.get("repo") != str(self.repo)
+                        or data.get("branch") != branch):
+                    continue
+                old_path = Path(data.get("plan_path", ""))
+                old_dir = old_path.parent
+                match = re.fullmatch(r"backport_plan_(\d+)", old_dir.name)
+                if (not match or int(match.group(1)) >= current_number
+                        or old_path.name != "backport_plan.json"
+                        or old_dir.parent != root):
+                    continue
+                plan = BackportPlan.load(str(old_path))
+                if data.get("plan_sha256") != plan.digest:
+                    # A mismatched old plan cannot be safely classified.
+                    raise KBError(f"prior journal does not match its plan: "
+                                  f"{journal_path}")
+                cursor = data.get("cursor")
+                if (not isinstance(cursor, int) or isinstance(cursor, bool)
+                        or cursor < 0 or cursor > len(plan.order)):
+                    raise KBError(f"prior journal has invalid cursor: "
+                                  f"{journal_path}")
+                if cursor < len(plan.order) or data.get("blocked"):
+                    unfinished.add(str(old_dir))
+            except (OSError, ValueError, TypeError) as exc:
+                raise KBError(f"cannot inspect prior journal "
+                              f"{journal_path}: {exc}") from exc
+        if unfinished:
+            names = ", ".join(sorted(unfinished))
+            raise KBError(
+                f"newest plan is {selected}, but an older planning cycle "
+                f"has unfinished execution: {names}. Select the intended "
+                "cycle explicitly with --results-dir DIR; automatic "
+                "selection will not abandon an unfinished session."
+            )
 
     def _append(self, sha: str, status: str, **other) -> None:
         self.journal["entries"].append({"sha": sha, "status": status, **other})
@@ -1575,7 +1963,7 @@ class PlannedBackporter(KernelBackporter):
         if not blocked or self.batch_plan.order[self.journal["cursor"]] != blocked["sha"]:
             raise KBError("working HEAD differs from journal; refusing unrelated/unrecorded commits")
         if not self.work_git.is_ancestor(recorded, actual):
-            raise KBError("working HEAD has diverged from journal; refusing to resume")
+            raise KBError("working HEAD has diverged from journal; cannot continue")
         new = self.work_git.run(["rev-list", "--reverse", f"{recorded}..{actual}"]).splitlines()
         if len(new) != 1:
             raise KBError("expected exactly one manually resolved commit since blocked HEAD")
@@ -1595,8 +1983,12 @@ class PlannedBackporter(KernelBackporter):
         print(f"Reconciled manual backport {upstream[:12]} -> {actual[:12]}")
 
     def prepare_plan(self) -> None:
-        # A progress copy is entirely opt-in. Do not invent or increment names.
-        # Validate paths before any journal or working-tree mutation.
+        if self.args.worksheet:
+            self.worksheet = BackportWorksheet(self.args.worksheet, self.batch_plan)
+        # Legacy progress snapshots remain opt-in for explicit --plan users.
+        # The new worksheet mode updates one live document in place.
+        if self.worksheet is not None and self.args.progress_output:
+            raise KBError("--worksheet and --progress-output are mutually exclusive")
         if self.args.progress_output:
             # Avoid resolving the final path component so dangling symlinks
             # cannot bypass the existence check and redirect the output.
@@ -1621,18 +2013,26 @@ class PlannedBackporter(KernelBackporter):
             raise KBError("working tree/index is not clean; resolve or commit changes first")
         if self.args.check_command:
             raise KBError("--check-command is not supported in plan mode; run kernel-builder separately")
-        self._load_journal()
-        if self.args.resume:
-            if self.args.dry_run and self.work_git.rev_parse("HEAD") != self.journal["last_head"]:
-                raise KBError("dry-run cannot reconcile changed HEAD; resume without --dry-run first")
-            self._reconcile_head()
-        # Reject a stale plan even if the current CS10 remote is now newer.
+        self._guard_unfinished_prior_cycles()
+        continuing = self._load_journal()
+        if continuing:
+            if self.args.dry_run:
+                if self.work_git.rev_parse("HEAD") != self.journal["last_head"]:
+                    raise KBError(
+                        "dry-run cannot reconcile changed HEAD; run without "
+                        "--dry-run to reconcile a manual commit first")
+            else:
+                self._reconcile_head()
+        # Reject stale Git state on every invocation, even if the worksheet
+        # says Done. A journal is the authority for a continuing session.
         current = self.work_git.rev_parse("HEAD")
-        if self.args.resume:
+        if continuing:
             if current != self.journal["last_head"]:
                 raise KBError("working HEAD does not match recorded execution state")
         elif current != self.batch_plan.baseline:
             raise KBError(f"working HEAD {current} does not match plan baseline {self.batch_plan.baseline}")
+        if self.worksheet is not None and not self.args.dry_run:
+            self.worksheet.synchronize(self.journal)
         self.upstream, self.current_ds, self.target, self.current_ds_head = self.refs.prepare()
         if self.target != self.batch_plan.target:
             raise KBError(f"upstream target differs from plan: {self.target} != {self.batch_plan.target}")
@@ -1641,14 +2041,18 @@ class PlannedBackporter(KernelBackporter):
         if not self.work_git.is_ancestor(self.batch_plan.baseline, current):
             raise KBError("plan baseline is not an ancestor of working HEAD")
         self.work_index = ProvenanceIndex(self.work_git, "HEAD", "working-tree", self.args.debug)
-        if not self.args.dry_run and not self.args.resume:
+        if not self.args.dry_run and not continuing:
             self._write_journal()
+        print(f"Session: {'CONTINUING' if continuing else 'STARTING'} "
+              f"(cursor {self.journal['cursor']}/{len(self.batch_plan.order)})")
         print(f"Plan: {self.batch_plan.path}")
         print(f"Plan SHA256: {self.batch_plan.digest}")
         print(f"Baseline: {self.batch_plan.baseline}")
         print(f"Working HEAD: {current}")
         print(f"Selected missing commits: {len(self.batch_plan.order)}")
         print(f"Journal: {self.journal_path}")
+        if self.worksheet is not None:
+            print(f"Worksheet: {self.worksheet.path}")
         if self.current_ds_head != self.batch_plan.baseline:
             print("NOTE: official CS10 has advanced since the plan; the working baseline is unchanged")
 
@@ -1658,6 +2062,7 @@ class PlannedBackporter(KernelBackporter):
         Do not refresh reference repositories, index millions of commits, or
         reconcile the journal here. A Git reset is not a journal reset.
         """
+        self._guard_unfinished_prior_cycles()
         plan = self.batch_plan
         actual = self.work_git.rev_parse("HEAD")
         expected = self._new_journal()
@@ -1669,6 +2074,8 @@ class PlannedBackporter(KernelBackporter):
         print(f"Baseline: {plan.baseline}")
         print(f"Working HEAD: {actual}")
         print(f"Journal: {self.journal_path}")
+        if self.args.worksheet:
+            print(f"Worksheet: {self.args.worksheet} (read-only)")
         print(f"Planned: {take} TAKE, {skipped} SKIP/REVIEW "
               f"({len(plan.order)} ordered entries)")
 
@@ -1689,48 +2096,11 @@ class PlannedBackporter(KernelBackporter):
             journal = json.loads(self.journal_path.read_text())
         except (OSError, ValueError) as exc:
             raise KBError(f"cannot read status journal: {exc}") from exc
-        if not isinstance(journal, dict):
-            raise KBError("journal must be a JSON object")
-        for field in ("schema_version", "plan_sha256", "repo", "branch",
-                      "baseline", "target"):
-            if journal.get(field) != expected[field]:
-                raise KBError(f"journal {field} differs from this "
-                              "plan/repository; refusing progress claim")
-        entries = journal.get("entries")
-        cursor = journal.get("cursor")
-        if (not isinstance(cursor, int) or isinstance(cursor, bool)
-                or not 0 <= cursor <= len(plan.order)
-                or not isinstance(entries, list)
-                or len(entries) != cursor):
-            raise KBError("journal entries/cursor are inconsistent")
-        valid = {"APPLIED", "APPLIED_MANUALLY", "ALREADY_PRESENT",
-                 "SKIPPED_POLICY"}
-        for position, entry in enumerate(entries):
-            if (not isinstance(entry, dict)
-                    or entry.get("sha") != plan.order[position]
-                    or entry.get("status") not in valid):
-                raise KBError("journal entry order/status is invalid at "
-                              f"position {position + 1}")
-            if entry["status"] in ("APPLIED", "APPLIED_MANUALLY"):
-                sha = entry.get("downstream_sha")
-                if not isinstance(sha, str) or not SHA40_RE.fullmatch(sha):
-                    raise KBError("journal APPLIED entry lacks downstream SHA")
+        self._validate_journal(journal)
+        entries = journal["entries"]
+        cursor = journal["cursor"]
         blocked = journal.get("blocked")
-        if blocked is not None:
-            if (not isinstance(blocked, dict) or cursor >= len(plan.order)
-                    or blocked.get("sha") != plan.order[cursor]):
-                raise KBError("journal blocked entry does not match cursor")
-        recorded = journal.get("last_head")
-        if not isinstance(recorded, str) or not SHA40_RE.fullmatch(recorded):
-            raise KBError("journal last_head is invalid")
-        last_applied = next(
-            (entry["downstream_sha"] for entry in reversed(entries)
-             if entry["status"] in ("APPLIED", "APPLIED_MANUALLY")),
-            plan.baseline,
-        )
-        if recorded != last_applied:
-            raise KBError("journal last_head differs from recorded applied "
-                          "commit")
+        recorded = journal["last_head"]
 
         applied = sum(e["status"] in ("APPLIED", "APPLIED_MANUALLY")
                       for e in entries)
@@ -1771,8 +2141,9 @@ class PlannedBackporter(KernelBackporter):
                 if actual == plan.baseline:
                     print("Git is at the plan baseline, consistent with a "
                           "hard reset; the old journal still records work")
-            print("Do not use --resume or start a new run with this journal. "
-                  "Archive the stale journal explicitly before replaying.")
+            print("Execution cannot continue with a divergent journal. "
+                  "Investigate Git and archive the stale journal explicitly "
+                  "before replaying from the baseline.")
             return 2
         if not self.work_git.status_clean():
             print("Status: DIRTY WORKTREE (journal HEAD matches, "
@@ -1985,9 +2356,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         ),
     )
     p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
-    mode = p.add_mutually_exclusive_group(required=True)
+    mode = p.add_mutually_exclusive_group()
     mode.add_argument("-c", "--commit", help="upstream commit SHA for single-commit mode")
-    mode.add_argument("--plan", help="planner JSON report for bounded TAKE batch execution")
+    mode.add_argument("--plan", help="explicit planner JSON for bounded TAKE batches")
+    mode.add_argument("--results-dir", help="explicit planning cycle directory; "
+                      "default is latest completed run under "
+                      "$KERNEL_WORKSPACE_DIR/backport-plans")
     p.add_argument("-j", "--jira", help="Jira ID, e.g. RHEL-223619")
     p.add_argument("--status", action="store_true",
                    help="read-only plan progress and Git/journal consistency")
@@ -1997,14 +2371,16 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
                    "plan mode uses its JSON target")
     p.add_argument("--max-attempts", type=int, default=1,
                    help="max TAKE commits attempted per plan invocation (default: 1)")
-    p.add_argument("--resume", action="store_true",
-                   help="resume existing plan execution journal")
     p.add_argument("--journal", help="override plan execution journal location")
-    p.add_argument("--text-plan", help="original planner text report; default: JSON path with .c suffix")
+    p.add_argument("--worksheet", help="editable worksheet for an explicit --plan "
+                   "(updated in place; preserves engineer annotations)")
+    p.add_argument("--text-plan", help="legacy source for --progress-output snapshots")
     p.add_argument("--progress-output", help="user-chosen progress filename; never overwrite")
     p.add_argument(
         "--repo",
-        help="downstream working repository (default: $KERNEL_SRC_DIR, then current directory)",
+        help="downstream working repository (default: "
+             "$KERNEL_WORKSPACE_DIR/centos-stream-$CS_VERSION; "
+             "fallback: $KERNEL_SRC_DIR, then current directory)",
     )
     p.add_argument(
         "--reference-root",
@@ -2046,22 +2422,56 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--signoff-email")
     p.add_argument("--debug", action="store_true")
     args = p.parse_args(argv)
+    # Explicit -c, --plan and --results-dir always override discovery.
+    args.auto_selected = False
+    # Prefer the shared workspace over the obsolete per-plan variable, so a
+    # stale shell export cannot silently pin a previous run.
+    if not (args.plan or args.commit or args.results_dir):
+        workspace = os.environ.get("KERNEL_WORKSPACE_DIR")
+        if workspace:
+            try:
+                args.results_dir = str(latest_completed_plan_directory(workspace))
+                args.auto_selected = True
+            except KBError as exc:
+                p.error(str(exc))
+        else:
+            args.results_dir = os.environ.get("KERNEL_BACKPORT_PLANNER_DIR")
+        if not args.results_dir:
+            p.error("specify -c, --plan, --results-dir, or set "
+                    "KERNEL_WORKSPACE_DIR")
+    if args.results_dir:
+        directory = Path(args.results_dir).expanduser().resolve()
+        if not directory.is_dir():
+            p.error(f"planning results directory does not exist: {directory}")
+        plan = directory / "backport_plan.json"
+        worksheet = directory / "backport_worksheet.txt"
+        for path in (plan, worksheet):
+            if path.is_symlink() or not path.is_file():
+                p.error(f"planning result is missing or a symlink: {path}")
+        if args.worksheet:
+            p.error("--worksheet cannot override the standard --results-dir worksheet")
+        args.plan = str(plan)
+        args.worksheet = str(worksheet)
+        args.results_dir = str(directory)
     if not args.status and not args.jira:
         p.error("-j/--jira is required except with --status")
     if args.status:
         if not args.plan:
             p.error("--status requires --plan")
-        if (args.resume or args.dry_run or args.progress_output
+        if (args.dry_run or args.progress_output
                 or args.text_plan or args.check_command
                 or args.max_attempts != 1):
-            p.error("--status is read-only; cannot combine with --resume, "
+            p.error("--status is read-only; cannot combine with "
                     "--dry-run, --progress-output, --text-plan, "
                     "--check-command, or --max-attempts")
     if args.max_attempts < 1:
         p.error("--max-attempts must be at least 1")
-    if not args.plan and (args.resume or args.journal or args.text_plan or
-                          args.progress_output or args.max_attempts != 1):
-        p.error("--resume, --journal, --text-plan, --progress-output and --max-attempts require --plan")
+    if not args.plan and (args.journal or args.text_plan or
+                          args.progress_output or args.worksheet or
+                          args.max_attempts != 1):
+        p.error("plan execution flags require --plan or --results-dir")
+    if args.worksheet and args.progress_output:
+        p.error("--worksheet cannot be combined with --progress-output")
     if args.text_plan and not args.progress_output:
         p.error("--text-plan requires --progress-output")
     if args.dry_run and args.progress_output:
@@ -2072,6 +2482,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     print(f"{Path(sys.argv[0]).name} {VERSION}")
+    if args.results_dir:
+        print(f"Planning cycle: {args.results_dir}")
     if args.plan:
         # A missing --target is resolved by the validated plan after loading.
         if args.target is None:
@@ -2081,12 +2493,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     return KernelBackporter(args).run()
 
 
-if __name__ == "__main__":
+def cli(argv: Sequence[str] | None = None) -> int:
+    """CLI entry point with one best-effort notification per actual run.
+
+    Read-only status, help, version and argument-validation errors remain
+    silent. Normal plan/single-commit runs, including dry runs, signal the
+    actual result. The library-facing main() stays silent for tests/imports.
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    notify = not any(arg in ("--status", "--version", "-h", "--help")
+                     for arg in args)
     try:
-        raise SystemExit(main())
+        result = main(args)
     except KeyboardInterrupt:
         print("kernel-backporter: interrupted", file=sys.stderr)
-        raise SystemExit(130)
+        if notify:
+            play_backporter_completion_sound(False)
+        return 130
     except KBError as exc:
         print(f"kernel-backporter: {exc}", file=sys.stderr)
-        raise SystemExit(1)
+        if notify:
+            play_backporter_completion_sound(False)
+        return 1
+    # argparse SystemExit (including invalid options) is handled by the usual
+    # CLI mechanism and does not count as a completed backport attempt.
+    if notify:
+        play_backporter_completion_sound(result == 0)
+    return result
+
+
+if __name__ == "__main__":
+    raise SystemExit(cli())

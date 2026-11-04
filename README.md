@@ -14,7 +14,7 @@ The central safety rule is simple:
 > `kernel-backporter` may add known upstream prerequisite commits, but it never
 > edits conflicted source code automatically.
 
-Current version: **0.2.4**
+Current version: **0.2.7**
 
 ## What it does
 
@@ -109,14 +109,176 @@ kernel-backporter --version
 Expected:
 
 ```text
-kernel-backporter 0.2.4
+kernel-backporter 0.2.7
 ```
 
 Every normal run also prints the version as its first line.
 
+## Automatic continuation (0.2.7)
+
+There is **no `--resume` option**. Invoke the exact same backporter command
+for the first and every subsequent batch in a planning cycle. The tool looks
+for the execution journal that belongs to the selected plan and repository:
+
+- No journal: start at the frozen plan baseline and create one on the first
+  real execution.
+- Valid journal: verify its plan identity, Git branch, recorded commit sequence,
+  cursor, and last Git HEAD; then continue from its next unprocessed entry.
+- Blocked journal plus one manual resolution commit: reconcile only if the
+  new commit has the exact upstream cherry-pick provenance trailer.
+- Dirty tree, unrelated HEAD changes, hard reset, corrupt journal, or changed
+  plan: refuse execution. The worksheet's editable `// Done` lines cannot
+  override Git and the journal.
+
+A `--dry-run` with an existing journal starts its simulated checks at the
+journal cursor but does not change the journal or living worksheet. If a
+blocked commit was manually resolved and Git HEAD advanced, perform a normal
+run first so that the backporter can validate and record that resolution.
+
+```bash
+# Both commands are identical, whether this is batch 1 or batch 20.
+kernel-backporter -l stable -j RHEL-223619 --max-attempts 6
+kernel-backporter -l stable -j RHEL-223619 --max-attempts 6
+```
+
+**Cycle switching safeguard:** Workspace discovery still selects the newest
+completed planner run, but a new cycle is **not automatically started** when an
+older cycle for this workspace, repository, and branch has an unfinished journal.
+The backporter reports the older cycle and asks for an explicit `--results-dir`.
+After you deliberately start the newer cycle once, its journal identifies it as
+selected and future normal invocations can continue it automatically. Completed
+older journals do not block new plans. Explicit `--plan`/`--results-dir` always
+select the requested cycle; Git baseline checks still apply.
+
+To *restart* the same plan after a hard reset, first verify the exact plan
+baseline and a clean tree, then explicitly archive the stale journal (see
+"Read-only plan status" below). The tool never silently discards history.
+Previous scripts containing `--resume` must simply remove that option.
+
+## Automatic workspace discovery and completion sounds (0.2.6+)
+
+Use the same `$KERNEL_WORKSPACE_DIR` convention as kernel-builder and
+kernel-backport-planner. **There is no need to export a separate plan directory.**
+When no `-c`, `--plan` or `--results-dir` is supplied, the backporter selects
+**the highest-numbered completed** cycle under:
+
+```text
+$KERNEL_WORKSPACE_DIR/backport-plans/
+    backport_plan_29/
+        backport_plan.json       # frozen machine-readable execution plan
+        backport_worksheet.txt  # living, editable engineering worksheet
+    backport_plan_29.zip        # planner's immutable completion snapshot
+```
+
+The next cycle can be numbered `backport_plan_30` or higher. Selection is by
+**numeric run number**, not modification time. A cycle must have both primary
+files and its completed ZIP snapshot; an interrupted or partially packaged
+newer run is ignored. The selected directory is printed on every invocation.
+The planner's JSON is never changed by the backporter.
+
+```bash
+export KERNEL_WORKSPACE_DIR="$HOME/projects/rhel-223619"
+export CS_VERSION=10
+
+# Source tree is also derived from the workspace (unless --repo is supplied).
+"$KERNEL_BACKPORTER" --status
+
+# Preflight six TAKE attempts, without altering journal or worksheet.
+"$KERNEL_BACKPORTER" -l stable -j RHEL-223619 \
+    --max-attempts 6 --dry-run
+
+# Apply six TAKE attempts, updating the journal and living worksheet.
+"$KERNEL_BACKPORTER" -l stable -j RHEL-223619 \
+    --max-attempts 6
+
+# Inspect progress and technical notes in the chosen worksheet.
+"$KERNEL_BACKPORTER" --status
+less "$KERNEL_WORKSPACE_DIR/backport-plans/backport_plan_29/"\
+"backport_worksheet.txt"
+
+# Continue from the journal, using exactly the same command.
+"$KERNEL_BACKPORTER" -l stable -j RHEL-223619 \
+    --max-attempts 6
+```
+
+**Important:** If a newer completed planning cycle appears while you are
+still executing an unfinished older one, the tool refuses to automatically
+start the newer cycle. To continue the older cycle, provide
+`--results-dir "$KERNEL_WORKSPACE_DIR/backport-plans/backport_plan_29"`.
+To deliberately start the newer cycle after establishing its new Git baseline,
+select it once with `--results-dir`. Future normal runs then continue it.
+Explicit `-c`, `--plan`, and `--results-dir` always override automatic
+selection. The old `KERNEL_BACKPORT_PLANNER_DIR` variable is supported only
+when `$KERNEL_WORKSPACE_DIR` is unset; the workspace takes precedence.
+
+For normal runs (including dry runs), the backporter plays a **single
+completion sound** using the same Freedesktop sounds as kernel-builder:
+
+- Success: `/usr/share/sounds/freedesktop/stereo/complete.oga`
+- Failure, blocked backport, or interruption:
+  `/usr/share/sounds/freedesktop/stereo/service-logout.oga`
+
+It tries `canberra-gtk-play`, `pw-play`, then `paplay`. Missing sound players,
+files, or audio-server connectivity never affect the exit status. To choose
+another sound directory, set `KBB_SOUND_DIR`. `--status`, `--version`, and
+help are silent.
+
+## Live Backport Worksheet (0.2.5+)
+
+The planner's JSON and frozen source baseline **never change** during
+backporting. The backporter maintains the separate `journal.json`, and updates
+only the recognized `// Take`/`// Done`/`// Review (conflict)` status
+annotations and its own adjacent `backporter: BLOCKED` line in the worksheet.
+The advisor's technical rationale, prerequisites, and engineer's annotations
+are preserved. Add investigation and resolution notes anywhere **outside** the
+machine-owned header status and adjacent `backporter: BLOCKED` line. Do not
+manually change status headers to control execution: the journal and Git are
+authoritative. For `APPLIED`, the worksheet records the new downstream SHA:
+
+```text
+40f742b07ab2 [DEPENDENCY] ("rk3576-armsom-sige5 board") // Done 141fc6cb843e
+      advisor-rationale: ...
+      engineer-note: Built and validated on arm64
+```
+
+When a cherry-pick cannot proceed, it stops, writes the existing conflict
+dossier, marks the worksheet header `Review (conflict)` or
+`Review (prerequisite)`, and adds a `backporter: BLOCKED` line showing the
+reason, paths, and dossier location when available. Read that commit's advisor
+commentary in the worksheet, inspect the dossier and Git, and add resolution
+notes. After manually committing the blocked backport with the exact upstream
+cherry-pick provenance trailer, the next normal invocation reconciles that
+commit and marks it Done. It does **not** automatically import additional prerequisites in plan
+mode. If an engineer decides to introduce additional fixes or dependencies,
+record them in Git and the worksheet; once drift grows significant, build,
+submit an incremental MR, establish a new downstream baseline, and create a
+new planning cycle. Never mutate the frozen plan to represent that work.
+
+Worksheet updates are atomic and preserve unrelated text. The file's commit
+headers must match the JSON order and decisions. The backporter refuses to
+write if the worksheet is missing, mismatched, symlinked, or changed during
+preparation. The journal is saved before the worksheet: if a worksheet write
+fails, the applied Git commits and journal remain authoritative; repair the
+worksheet and invoke the backporter again to synchronize it before proceeding. Avoid editing
+the worksheet simultaneously with an active backporter process.
+
+`--results-dir DIR` explicitly selects a planning cycle and takes precedence
+over workspace auto-discovery. `--plan FILE` remains available for historical
+numbered JSON plans and overrides the environment variable without silently
+selecting a worksheet. Add `--worksheet FILE` to enable in-place updates for an
+explicit plan. In single-commit mode (`-c SHA`), plan auto-discovery is ignored. `--status` never updates the worksheet or journal.
+
+A hard Git reset does **not** reset the journal or worksheet. `--status`
+reports divergence. Only after confirming the baseline and a clean tree should
+the engineer explicitly archive the stale journal; the next execution can
+then reconcile the worksheet's status annotations against its new journal.
+Keep a copy or the planner's original ZIP if historical worksheet content is
+important; this tool does not auto-backup every manual edit.
+
 ## Read-only plan status (0.2.4)
 
-Use `--status` with `--plan` to inspect journal progress **without**
+Use `--status` with `--plan` or a selected planning-cycle directory to
+inspect journal progress **without**
 fetching/updating references, indexing the kernel tree, changing Git, or
 writing a journal or progress report. Jira is optional for this command.
 Run it from the intended downstream kernel repository (or pass `--repo`).
@@ -141,8 +303,7 @@ journal.
 backporter's journal. If the journal records six applied commits but the
 branch has returned to the plan baseline, `--status` reports `DIVERGED` and
 explicitly warns that those recorded commits are **not verified** on the
-current branch. Neither normal execution nor `--resume` can reuse that stale
-journal. The status command never deletes, rewrites, or reconciles it.
+current branch. Normal execution cannot reuse that stale journal. The status command never deletes, rewrites, or reconciles it.
 
 To replay the same plan from scratch, first verify that the working HEAD is
 exactly the plan baseline and the tree is clean; then **archive** the stale
@@ -160,11 +321,13 @@ This is an explicit user action, not something `--status` performs. Preserve
 archived journals for historical provenance. The next real invocation will
 create a new journal for the same plan and current repository.
 
-## User-named text-plan progress reports (0.2.2)
+## Legacy user-named progress snapshots (0.2.2)
 
-Progress reports are opt-in. Supply `--progress-output` with a new destination
+For older numbered `.c` reports, one-time progress snapshots remain opt-in.
+Supply `--progress-output` with a new destination
 filename on each non-dry-run invocation. The backporter does not choose or
-increment suffixes. Without that argument, no progress copy is written.
+increment suffixes. Without that argument, no legacy progress copy is written. The preferred
+workspace workflow instead maintains one live `backport_worksheet.txt` in place.
 
 First batch:
 
@@ -180,7 +343,7 @@ Next batch:
 ```bash
 kernel-backporter -j RHEL-223619 \
     --plan ~/projects/rhel-223619/backport_plan_17.json \
-    --resume --max-attempts 2 \
+    --max-attempts 2 \
     --progress-output ~/projects/rhel-223619/backport_plan_17_3.c
 ```
 
@@ -236,7 +399,7 @@ completed:
 ```bash
 kernel-backporter -j RHEL-223619 \
     --plan ~/projects/rhel-223619/backport_plan_17.json \
-    --max-attempts 5 --resume
+    --max-attempts 5
 ```
 
 `--max-attempts` counts **eligible TAKE attempts**, including a failed preflight,
@@ -248,9 +411,9 @@ behavior is unchanged.
 The executor reads `order` rather than iterating the JSON `commits` dictionary.
 It verifies all ordered entries are selected and missing, the plan's target
 exists, and the **working HEAD matches the frozen plan baseline** on the first
-run. On resume it verifies the journal's plan hash, repository, branch, target,
-and last committed HEAD. It checks explicit advisor prerequisites before each
-TAKE. A missing prerequisite, a SKIP/REVIEW prerequisite, a conflict, an empty
+run. On each later invocation it verifies the journal's plan hash, repository,
+branch, target, recorded entries and last committed HEAD. It checks
+explicit advisor prerequisites before each TAKE. A missing prerequisite, a SKIP/REVIEW prerequisite, a conflict, an empty
 cherry-pick, or a changed working tree **stops the batch**. It will not silently
 add another upstream prerequisite or edit conflicted files.
 
@@ -266,8 +429,8 @@ an atomic journal under:
 
 You can override the journal location with `--journal`. Never edit the journal
 manually. Each entry records the upstream SHA, its disposition, and the produced
-downstream SHA when applicable. Running the same plan again without `--resume`
-will refuse to overwrite an existing journal.
+downstream SHA when applicable. Running the same plan again automatically
+continues from that journal rather than overwriting it.
 
 ### When a batch stops
 
@@ -280,9 +443,9 @@ exact provenance trailer:
 (cherry picked from commit <full 40-character upstream SHA>)
 ```
 
-On `--resume`, one such intervening manually committed resolution is reconciled
-against the blocked upstream SHA. The tool refuses unrelated HEAD changes,
-missing provenance, or multiple unexpected commits. If a real-tree cherry-pick
+On the next normal invocation, one such intervening manually committed
+resolution is reconciled against the blocked upstream SHA. The tool refuses
+unrelated HEAD changes, missing provenance, or multiple unexpected commits. If a real-tree cherry-pick
 unexpectedly conflicts, it leaves the repository for manual inspection rather
 than resetting it. Resolve and commit with provenance before resuming.
 
