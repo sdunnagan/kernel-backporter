@@ -863,6 +863,141 @@ class WorksheetIntegrationTests(PlanModeBase):
         with self.assertRaises(SystemExit):
             kb.parse_args(self.dir_args("--progress-output", str(self.root / "out.c")))
 
+    def annotate(self, sha, decision, rationale=None):
+        anchor = f'{sha[:12]} [DEPENDENCY] ("'
+        lines = self.worksheet.read_text().splitlines(keepends=True)
+        for index, line in enumerate(lines):
+            if line.startswith(anchor):
+                annotation = f"      engineer-decision: {decision}\n"
+                if rationale:
+                    annotation += f"      engineer-rationale: {rationale}\n"
+                lines.insert(index + 1, annotation)
+                self.worksheet.write_text("".join(lines))
+                return
+        raise AssertionError(f"missing worksheet SHA {sha}")
+
+    def test_engineer_skip_is_journaled_and_preserves_advisor_and_text(self):
+        original = (self.results / "backport_plan.json").read_bytes()
+        self.annotate(self.b, "SKIP", "Not in the chosen product scope")
+        self.annotate(self.c, "SKIP", "Not in the chosen product scope")
+        self.assertEqual(self.dir_run("--max-attempts", "1"), 0)
+        state = json.loads(self.journals()[0].read_text())
+        self.assertEqual([entry["status"] for entry in state["entries"]],
+                         ["APPLIED", "SKIPPED_ENGINEER", "SKIPPED_ENGINEER"])
+        self.assertEqual(state["entries"][1]["engineer_rationale"],
+                         "Not in the chosen product scope")
+        self.assertEqual(git(self.work, "rev-list", "--count", f"{self.base}..HEAD"), "1")
+        self.assertIn(f'{self.b[:12]} [DEPENDENCY] ("B") // Skip (engineer)',
+                      self.worksheet.read_text())
+        self.assertIn("      advisor: TAKE", self.worksheet.read_text())
+        self.assertEqual((self.results / "backport_plan.json").read_bytes(), original)
+        self.assertEqual(self.dir_run(), 0)
+        self.assertEqual(json.loads(self.journals()[0].read_text())["cursor"], 3)
+
+    def test_engineer_take_can_promote_advisor_skip(self):
+        self.build_plan(decisions={self.b: "SKIP"})
+        (self.results / "backport_plan.json").write_bytes(self.planfile.read_bytes())
+        self.worksheet.write_text(self.text_template().read_text())
+        self.annotate(self.b, "TAKE", "Required for the selected feature")
+        self.assertEqual(self.dir_run("--max-attempts", "3"), 0)
+        self.assertEqual([e["status"] for e in
+                          json.loads(self.journals()[0].read_text())["entries"]],
+                         ["APPLIED"] * 3)
+        self.assertIn("      advisor: SKIP", self.worksheet.read_text())
+        self.assertIn("      engineer-decision: TAKE", self.worksheet.read_text())
+
+    def test_skipping_blocked_commit_reconciles_without_source_edit(self):
+        self.build_plan(prereqs={self.a: [self.c]})
+        (self.results / "backport_plan.json").write_bytes(self.planfile.read_bytes())
+        self.assertEqual(self.dir_run("--max-attempts", "2"), 2)
+        self.assertIn("// Review (prerequisite)", self.worksheet.read_text())
+        self.annotate(self.a, "SKIP", "Board not in backport scope")
+        self.assertEqual(self.dir_run("--max-attempts", "2"), 0)
+        state = json.loads(self.journals()[0].read_text())
+        self.assertEqual(state["cursor"], 3)
+        self.assertIsNone(state["blocked"])
+        self.assertEqual([e["status"] for e in state["entries"]],
+                         ["SKIPPED_ENGINEER", "APPLIED", "APPLIED"])
+        self.assertIn("// Skip (engineer)", self.worksheet.read_text())
+        self.assertNotIn("backporter: BLOCKED", self.worksheet.read_text())
+
+    def test_skipping_required_prerequisite_refused_before_mutation(self):
+        self.build_plan(prereqs={self.b: [self.a]})
+        (self.results / "backport_plan.json").write_bytes(self.planfile.read_bytes())
+        self.annotate(self.a, "SKIP", "Board-specific")
+        before = self.worksheet.read_bytes()
+        with self.assertRaisesRegex(kb.KBError, "engineer SKIP conflicts"):
+            self.dir_run("--max-attempts", "3")
+        self.assertEqual(self.worksheet.read_bytes(), before)
+        self.assertEqual(git(self.work, "rev-parse", "HEAD"), self.base)
+        self.assertFalse(self.journals())
+        self.annotate(self.b, "SKIP", "Dependent board-specific change")
+        self.assertEqual(self.dir_run("--max-attempts", "3"), 0)
+        self.assertEqual([e["status"] for e in
+                          json.loads(self.journals()[0].read_text())["entries"]],
+                         ["SKIPPED_ENGINEER", "SKIPPED_ENGINEER", "APPLIED"])
+
+    def test_cannot_retroactively_skip_applied_commit(self):
+        self.assertEqual(self.dir_run("--max-attempts", "1"), 0)
+        before = self.journals()[0].read_bytes()
+        self.annotate(self.a, "SKIP")
+        with self.assertRaisesRegex(kb.KBError, "already processed"):
+            self.dir_run()
+        self.assertEqual(self.journals()[0].read_bytes(), before)
+
+    def test_dry_run_with_engineer_skip_is_read_only(self):
+        self.annotate(self.a, "SKIP")
+        before = self.worksheet.read_bytes()
+        self.assertEqual(self.dir_run("--dry-run", "--max-attempts", "1"), 0)
+        self.assertEqual(self.worksheet.read_bytes(), before)
+        self.assertEqual(git(self.work, "rev-parse", "HEAD"), self.base)
+        self.assertFalse(self.journals())
+
+    def test_status_uses_effective_worksheet_decisions_read_only(self):
+        self.annotate(self.a, "SKIP")
+        before = self.worksheet.read_bytes()
+        result = io.StringIO()
+        with contextlib.redirect_stdout(result):
+            self.assertEqual(self.dir_run("--status"), 0)
+        self.assertIn("2 TAKE, 1 SKIP/REVIEW", result.getvalue())
+        self.assertIn("1 engineer override", result.getvalue())
+        self.assertEqual(self.worksheet.read_bytes(), before)
+        self.assertFalse(self.journals())
+
+    def test_invalid_duplicate_and_missing_engineer_directives_fail_closed(self):
+        self.annotate(self.a, "MAYBE")
+        with self.assertRaisesRegex(kb.KBError, "invalid engineer-decision"):
+            self.dir_run()
+        self.worksheet.write_text(self.text_template().read_text())
+        self.annotate(self.a, "SKIP")
+        self.annotate(self.a, "SKIP")
+        with self.assertRaisesRegex(kb.KBError, "duplicate engineer-decision"):
+            self.dir_run()
+        self.assertFalse(self.journals())
+
+    def test_blocker_annotations_are_wrapped_and_resynchronized(self):
+        very_long = "x" * 180
+        blocked = {"sha": self.a, "reason": "prerequisite " + very_long,
+                   "files": ["arch/arm64/boot/dts/rockchip/" + very_long],
+                   "dossier": "/home/engineer/projects/" + very_long}
+        notes = kb.BackportWorksheet._blocked_lines(blocked, self.a)
+        self.assertGreater(len(notes), 5)
+        self.assertTrue(all(len(line) <= 80 for line in notes))
+        self.assertTrue(all(line.startswith("      backporter: ") for line in notes))
+        # Also ensure old single-line notes are removed and new wrapped ones
+        # are idempotent when written again from the same journal.
+        self.build_plan(prereqs={self.a: [self.c]})
+        (self.results / "backport_plan.json").write_bytes(self.planfile.read_bytes())
+        self.assertEqual(self.dir_run(), 2)
+        worksheet = kb.BackportWorksheet(str(self.worksheet),
+                    kb.BackportPlan.load(str(self.results / "backport_plan.json")))
+        journal = json.loads(self.journals()[0].read_text())
+        self.assertTrue(all(len(line) <= 80 for line in
+                            self.worksheet.read_text().splitlines()
+                            if "backporter:" in line))
+        self.assertFalse(worksheet.synchronize(journal))
+
+
 
 class WorkspaceTestFixtures(PlanModeBase):
     """Shared minimal fixture for new workspace and journal tests."""

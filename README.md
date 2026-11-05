@@ -14,7 +14,7 @@ The central safety rule is simple:
 > `kernel-backporter` may add known upstream prerequisite commits, but it never
 > edits conflicted source code automatically.
 
-Current version: **0.2.7**
+Current version: **0.2.8**
 
 ## What it does
 
@@ -109,7 +109,7 @@ kernel-backporter --version
 Expected:
 
 ```text
-kernel-backporter 0.2.7
+kernel-backporter 0.2.8
 ```
 
 Every normal run also prints the version as its first line.
@@ -227,19 +227,61 @@ help are silent.
 
 The planner's JSON and frozen source baseline **never change** during
 backporting. The backporter maintains the separate `journal.json`, and updates
-only the recognized `// Take`/`// Done`/`// Review (conflict)` status
-annotations and its own adjacent `backporter: BLOCKED` line in the worksheet.
+only the recognized header status (`// Take`, `// Done`, `// Review (conflict)`,
+or `// Skip (engineer)`) and its own `backporter: BLOCKED` annotations.
 The advisor's technical rationale, prerequisites, and engineer's annotations
 are preserved. Add investigation and resolution notes anywhere **outside** the
-machine-owned header status and adjacent `backporter: BLOCKED` line. Do not
-manually change status headers to control execution: the journal and Git are
-authoritative. For `APPLIED`, the worksheet records the new downstream SHA:
+machine-owned header status and `backporter:` lines. Do not manually change
+header status comments such as `// Take` to `// Skip`: the journal and Git
+are authoritative. Use `engineer-decision:` annotations instead.
+For `APPLIED`, the worksheet records the new downstream SHA:
 
 ```text
 40f742b07ab2 [DEPENDENCY] ("rk3576-armsom-sige5 board") // Done 141fc6cb843e
       advisor-rationale: ...
       engineer-note: Built and validated on arm64
 ```
+
+### Engineer decision overrides (0.2.8)
+
+The planner's `advisor: TAKE`, `SKIP`, or `REVIEW` remains intact. Before the
+backporter attempts an unprocessed commit, an engineer may add **exactly one**
+`engineer-decision: SKIP` or `engineer-decision: TAKE` annotation in that
+commit's worksheet block, optionally with `engineer-rationale:`. For example:
+
+```text
+c37393b36c1d [DEPENDENCY] ("arm64: dts: rockchip: refactor common Orange Pi 5 board") // Review (conflict)
+      advisor: TAKE
+      advisor-rationale: Upstream refactoring needed by another candidate.
+      engineer-decision: SKIP
+      engineer-rationale: Board-specific work outside this MR's scope.
+```
+
+Use `engineer-decision: SKIP` to exclude a candidate or unblock a stopped
+preflight without changing Git or rerunning the planner. Use `TAKE` to
+explicitly include a planner `SKIP`/`REVIEW` candidate. The backporter
+respects these decisions on the next invocation, writes `SKIPPED_ENGINEER`
+entries to the journal, records the optional rationale, and annotates completed
+skips as `// Skip (engineer)`. Skips do not consume `--max-attempts`.
+The original JSON plan is never modified. `--status` shows effective pending
+decisions; `--dry-run` respects them without changing journal or worksheet.
+
+**Dependency safeguard:** If a commit marked `engineer-decision: SKIP` is
+an explicit `advisor_prerequisites` dependency of a pending effective `TAKE`,
+the backporter refuses to run. Either skip the dependent commit too, restore
+the prerequisite to TAKE, or investigate whether the planner's relationship
+is truly required. The backporter does **not** silently remove a dependency
+chain or override the engineer's decision. Already completed commits cannot be
+retroactively skipped or replayed by editing the worksheet; the journal and
+Git remain authoritative. To undo an applied commit requires explicit Git
+work and a deliberately reconciled execution state, not a worksheet edit.
+
+The `backporter: BLOCKED` diagnostic is now wrapped at **80 characters per
+line**, with each continuation prefixed by `backporter:`. Long paths and
+other unbroken tokens may be split for display; the conflict dossier and
+journal retain the original values. Machine-owned diagnostic lines are
+replaced/cleared during journal synchronization, and engineer notes are
+preserved. Avoid editing the worksheet while the backporter is running.
 
 When a cherry-pick cannot proceed, it stops, writes the existing conflict
 dossier, marks the worksheet header `Review (conflict)` or
@@ -255,7 +297,8 @@ submit an incremental MR, establish a new downstream baseline, and create a
 new planning cycle. Never mutate the frozen plan to represent that work.
 
 Worksheet updates are atomic and preserve unrelated text. The file's commit
-headers must match the JSON order and decisions. The backporter refuses to
+headers must match the JSON order and advisor decisions; engineer overrides
+must use separate annotations. The backporter refuses to
 write if the worksheet is missing, mismatched, symlinked, or changed during
 preparation. The journal is saved before the worksheet: if a worksheet write
 fails, the applied Git commits and journal remain authoritative; repair the
@@ -403,7 +446,8 @@ kernel-backporter -j RHEL-223619 \
 ```
 
 `--max-attempts` counts **eligible TAKE attempts**, including a failed preflight,
-not successful commits; its default is one. Policy SKIP and REVIEW entries and
+not successful commits; its default is one. Policy SKIP and REVIEW entries,
+engineer SKIP overrides, and
 commits already proven present do not count. There is no special `--commit 0`:
 `--commit SHA` and `--plan FILE` are mutually exclusive. Existing single-commit
 behavior is unchanged.
@@ -449,7 +493,8 @@ unrelated HEAD changes, missing provenance, or multiple unexpected commits. If a
 unexpectedly conflicts, it leaves the repository for manual inspection rather
 than resetting it. Resolve and commit with provenance before resuming.
 
-The planner's `advisor_prerequisites` are treated as explicit requirements.
+The planner's `advisor_prerequisites` are treated as explicit requirements,
+including when an engineer overrides decisions in the worksheet.
 Some recommendations in run 17 reference commits **outside its ordered TAKE
 set**. They will halt plan mode until inspected and resolved. A planner's
 replay-clean label is only an advisory prediction, not a guarantee that a TAKE

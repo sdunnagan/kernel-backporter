@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
 
-VERSION = "0.2.7"
+VERSION = "0.2.8"
 
 
 HEX40 = r"[0-9a-fA-F]{40}"
@@ -1594,18 +1594,21 @@ class PlanTextProgress:
 class BackportWorksheet:
     """Maintain a live engineer-editable worksheet from journal state.
 
-    The JSON plan, not worksheet annotations, controls the execution order.
-    Only the status field of a recognized commit header and the immediately
-    adjacent machine-owned blocker line may be changed. All other text is
-    preserved, including annotations inserted by the engineer.
+    The immutable JSON contains the advisor recommendations and plan order.
+    An explicit engineer-decision annotation can override TAKE/SKIP policy,
+    but never edit completed journal entries or source trees. The journal
+    remains the authoritative record of execution progress. All other text
+    is preserved, including annotations inserted by the engineer.
     """
 
     HEADER_RE = re.compile(
         r'^(?P<prefix>[0-9a-f]{12} (?:\[[^\]\n]+\] )?\(.*?\) )'
-        r'// (?P<status>Take|Skip|Review(?: \([^\n)]*\))?|'
+        r'// (?P<status>Take|Skip(?: \(engineer\))?|Review(?: \([^\n)]*\))?|'
         r'Done(?: [0-9a-f]{12,40}| \(already present\)))$'
     )
-    MANAGED_RE = re.compile(r"^      backporter: BLOCKED (.*)$")
+    MANAGED_RE = re.compile(r"^      backporter: (?:BLOCKED\b|  )")
+    ENGINEER_RE = re.compile(r"^      engineer-decision: (.*)$")
+    ENGINEER_RATIONALE_RE = re.compile(r"^      engineer-rationale: (.*)$")
 
     def __init__(self, filename: str, plan: BackportPlan):
         # Refuse symlinks rather than following them into an unrelated file.
@@ -1644,21 +1647,71 @@ class BackportWorksheet:
             status = match.group("status")
             if status in ("Take", "Skip", "Review") and status != original:
                 raise KBError(f"worksheet decision for {sha[:12]} contradicts "
-                              "the immutable plan JSON")
+                              "the immutable plan JSON; use engineer-decision")
         return raw, lines
 
+    def engineer_decisions(self) -> dict[str, dict[str, str]]:
+        """Parse explicit TAKE/SKIP overrides, rejecting ambiguity and typos."""
+        _, lines = self._read_validated()
+        overrides: dict[str, dict[str, str]] = {}
+        sha = None
+        index = 0
+        inside_annotations = False
+        rationale_by_sha: dict[str, str] = {}
+        for line in lines:
+            content = line.rstrip("\r\n")
+            header = self.HEADER_RE.fullmatch(content)
+            if header:
+                sha = self.plan.order[index]
+                index += 1
+                inside_annotations = True
+                continue
+            directive = self.ENGINEER_RE.fullmatch(content)
+            rationale = self.ENGINEER_RATIONALE_RE.fullmatch(content)
+            if directive or rationale or content.startswith((
+                    "      engineer-decision:", "      engineer-rationale:")):
+                if not inside_annotations or sha is None:
+                    raise KBError("engineer annotation must be within a "
+                                  "commit's worksheet annotations")
+                if directive:
+                    decision = directive.group(1)
+                    if decision not in ("TAKE", "SKIP"):
+                        raise KBError(f"invalid engineer-decision for {sha[:12]}: "
+                                      f"{decision!r}; use TAKE or SKIP")
+                    if sha in overrides:
+                        raise KBError(f"duplicate engineer-decision for {sha[:12]}")
+                    overrides[sha] = {"decision": decision}
+                elif rationale:
+                    if sha in rationale_by_sha:
+                        raise KBError(f"duplicate engineer-rationale for {sha[:12]}")
+                    rationale_by_sha[sha] = rationale.group(1)
+                else:
+                    raise KBError(f"malformed engineer annotation: {content!r}")
+            elif content and not content.startswith(" "):
+                inside_annotations = False
+        for sha, rationale in rationale_by_sha.items():
+            if sha not in overrides:
+                raise KBError(f"engineer-rationale for {sha[:12]} requires "
+                              "an engineer-decision")
+            overrides[sha]["rationale"] = rationale
+        return overrides
+
     @staticmethod
-    def _blocked_line(blocked: dict | None, sha: str) -> str | None:
+    def _blocked_lines(blocked: dict | None, sha: str) -> list[str]:
         if not blocked or blocked.get("sha") != sha:
-            return None
-        reason = " ".join(str(blocked.get("reason", "unknown")).split())
-        reason = reason[:500]
+            return []
+        reason = " ".join(str(blocked.get("reason", "unknown")).split())[:500]
         files = blocked.get("files") or []
         details = f"; files={','.join(str(x) for x in files[:12])}" if files else ""
         dossier = blocked.get("dossier")
         if dossier:
             details += f"; dossier={dossier}"
-        return f"      backporter: BLOCKED {reason}{details}"
+        return textwrap.wrap(
+            f"BLOCKED {reason}{details}", width=80,
+            initial_indent="      backporter: ",
+            subsequent_indent="      backporter:   ",
+            break_long_words=True, break_on_hyphens=False,
+        )
 
     def render(self, journal: dict, lines: list[str]) -> str:
         entries = {entry["sha"]: entry for entry in journal["entries"]}
@@ -1670,7 +1723,11 @@ class BackportWorksheet:
             line = lines[i]
             match = self.HEADER_RE.fullmatch(line.rstrip("\r\n"))
             if not match:
-                out.append(line)
+                # Engineer annotations may be inserted before an existing
+                # blocker note. Remove stale machine-owned notes anywhere in
+                # the commit section, not just immediately below its header.
+                if not self.MANAGED_RE.match(line.rstrip("\r\n")):
+                    out.append(line)
                 i += 1
                 continue
             sha = self.plan.order[cursor]
@@ -1684,6 +1741,8 @@ class BackportWorksheet:
                 status = "Done " + downstream[:12]
             elif entry and entry["status"] == "ALREADY_PRESENT":
                 status = "Done (already present)"
+            elif entry and entry["status"] == "SKIPPED_ENGINEER":
+                status = "Skip (engineer)"
             elif blocked and blocked.get("sha") == sha:
                 reason = str(blocked.get("reason", ""))
                 status = PlanTextProgress._review_reason(reason)
@@ -1692,15 +1751,17 @@ class BackportWorksheet:
                 "\n" if line.endswith("\n") else "")
             out.append(match.group("prefix") + "// " + status + newline)
             i += 1
-            # This one line is machine-owned; all other annotations are opaque.
-            if i < len(lines) and self.MANAGED_RE.fullmatch(lines[i].rstrip("\r\n")):
+            # Remove only contiguous machine-owned lines, including wrapped
+            # continuations from the previous invocation.
+            while (i < len(lines)
+                   and self.MANAGED_RE.match(lines[i].rstrip("\r\n"))):
                 i += 1
-            note = self._blocked_line(blocked, sha)
-            if note:
+            for note in self._blocked_lines(blocked, sha):
                 out.append(note + (newline or "\n"))
         return "".join(out)
 
-    def synchronize(self, journal: dict) -> bool:
+    def synchronize(self, journal: dict,
+                    expected_decisions: dict[str, dict[str, str]] | None = None) -> bool:
         """Atomically publish validated status changes; preserve manual edits.
 
         If the engineer changes the worksheet during preparation, refuse to
@@ -1710,6 +1771,10 @@ class BackportWorksheet:
         import stat
 
         raw, lines = self._read_validated()
+        if (expected_decisions is not None
+                and self.engineer_decisions() != expected_decisions):
+            raise KBError("engineer decisions changed while backporter was "
+                          "running; rerun with the updated worksheet")
         updated = self.render(journal, lines).encode("utf-8")
         if updated == raw:
             return False
@@ -1782,6 +1847,7 @@ class PlannedBackporter(KernelBackporter):
         self.text_progress: PlanTextProgress | None = None
         self.progress_output: Path | None = None
         self.worksheet: BackportWorksheet | None = None
+        self.engineer_decisions: dict[str, dict[str, str]] = {}
         self.work_index: ProvenanceIndex
 
     def _new_journal(self) -> dict:
@@ -1800,6 +1866,12 @@ class PlannedBackporter(KernelBackporter):
         }
 
     def _write_journal(self) -> None:
+        # Do not record an outdated decision if the engineer changed policy
+        # while a batch was executing. Completed Git commits remain authoritative.
+        if (self.worksheet is not None and
+                self.worksheet.engineer_decisions() != self.engineer_decisions):
+            raise KBError("engineer decisions changed while backporter was "
+                          "running; rerun with the updated worksheet")
         self.journal_path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(prefix=".plan-journal-", dir=self.journal_path.parent)
         try:
@@ -1814,7 +1886,7 @@ class PlannedBackporter(KernelBackporter):
         # The journal is committed before the worksheet. If the latter cannot
         # be written, the next invocation can recover the live worksheet.
         if self.worksheet is not None:
-            self.worksheet.synchronize(self.journal)
+            self.worksheet.synchronize(self.journal, self.engineer_decisions)
 
     def _validate_journal(self, journal: dict) -> None:
         """Reject corrupt or mismatched progress before skipping plan entries.
@@ -1837,13 +1909,15 @@ class PlannedBackporter(KernelBackporter):
                 or not isinstance(entries, list) or len(entries) != cursor):
             raise KBError("journal entries/cursor are inconsistent")
         valid = {"APPLIED", "APPLIED_MANUALLY", "ALREADY_PRESENT",
-                 "SKIPPED_POLICY"}
+                 "SKIPPED_POLICY", "SKIPPED_ENGINEER"}
         for position, entry in enumerate(entries):
             if (not isinstance(entry, dict)
                     or entry.get("sha") != self.batch_plan.order[position]
                     or entry.get("status") not in valid):
                 raise KBError("journal entry order/status is invalid at "
                               f"position {position + 1}")
+            if entry["status"] == "SKIPPED_ENGINEER" and entry.get("engineer_decision") != "SKIP":
+                raise KBError("journal engineer SKIP entry lacks engineer decision")
             if entry["status"] in ("APPLIED", "APPLIED_MANUALLY"):
                 sha = entry.get("downstream_sha")
                 if not isinstance(sha, str) or not SHA40_RE.fullmatch(sha):
@@ -1949,6 +2023,66 @@ class PlannedBackporter(KernelBackporter):
                 "selection will not abandon an unfinished session."
             )
 
+    def _decision(self, sha: str) -> str:
+        override = self.engineer_decisions.get(sha)
+        return override["decision"] if override else self.batch_plan.commits[sha]["advisor_decision"]
+
+    def _validate_engineer_overrides(self) -> None:
+        """Prevent retroactive policy changes or unsafe skipped prerequisites.
+
+        An engineer may change any pending decision, including a blocked one,
+        but not reinterpret entries that the journal has already consumed.
+        Reject an overridden SKIP required by a pending TAKE before touching
+        the source tree, journal, or worksheet.
+        """
+        entries = {entry["sha"]: entry for entry in self.journal["entries"]}
+        for sha, entry in entries.items():
+            decision = self._decision(sha)
+            status = entry["status"]
+            if status == "SKIPPED_ENGINEER":
+                okay = decision == "SKIP" and sha in self.engineer_decisions
+            elif status == "SKIPPED_POLICY":
+                okay = (decision == self.batch_plan.commits[sha]["advisor_decision"]
+                        and decision != "TAKE")
+            else:
+                okay = decision == "TAKE"
+            if not okay:
+                raise KBError(
+                    f"engineer-decision for already processed {sha[:12]} "
+                    f"conflicts with journal status {status}; completed commits "
+                    "cannot be changed retroactively"
+                )
+
+        conflicts = []
+        for sha, override in self.engineer_decisions.items():
+            if override["decision"] != "SKIP":
+                continue
+            for consumer in self.batch_plan.order:
+                if self._decision(consumer) != "TAKE" or consumer == sha:
+                    continue
+                if consumer in entries and entries[consumer]["status"] in (
+                    "APPLIED", "APPLIED_MANUALLY", "ALREADY_PRESENT"
+                ):
+                    continue
+                if sha in [item["sha"] for item in self.batch_plan.commits[consumer].get(
+                    "advisor_prerequisites", [])]:
+                    # A previously satisfied prerequisite is still available
+                    # even if the engineer later edits its annotation.
+                    if sha in entries and entries[sha]["status"] in (
+                        "APPLIED", "APPLIED_MANUALLY", "ALREADY_PRESENT"
+                    ):
+                        continue
+                    conflicts.append((sha, consumer))
+        if conflicts:
+            details = "; ".join(f"{dep[:12]} -> {consumer[:12]}"
+                                for dep, consumer in conflicts[:8])
+            raise KBError(
+                "engineer SKIP conflicts with selected TAKE prerequisite(s): "
+                f"{details}. Set engineer-decision: SKIP on the dependent "
+                "commit(s), restore the prerequisite to TAKE, or review the "
+                "planner dependency before continuing"
+            )
+
     def _append(self, sha: str, status: str, **other) -> None:
         self.journal["entries"].append({"sha": sha, "status": status, **other})
         self.journal["cursor"] += 1
@@ -1985,6 +2119,7 @@ class PlannedBackporter(KernelBackporter):
     def prepare_plan(self) -> None:
         if self.args.worksheet:
             self.worksheet = BackportWorksheet(self.args.worksheet, self.batch_plan)
+            self.engineer_decisions = self.worksheet.engineer_decisions()
         # Legacy progress snapshots remain opt-in for explicit --plan users.
         # The new worksheet mode updates one live document in place.
         if self.worksheet is not None and self.args.progress_output:
@@ -2015,7 +2150,14 @@ class PlannedBackporter(KernelBackporter):
             raise KBError("--check-command is not supported in plan mode; run kernel-builder separately")
         self._guard_unfinished_prior_cycles()
         continuing = self._load_journal()
+        self._validate_engineer_overrides()
         if continuing:
+            blocked = self.journal.get("blocked")
+            if (blocked and self._decision(blocked["sha"]) == "SKIP"
+                    and self.work_git.rev_parse("HEAD") != self.journal["last_head"]):
+                raise KBError("cannot SKIP the blocked commit after a manual "
+                              "Git commit; restore engineer-decision: TAKE "
+                              "to reconcile the manual resolution")
             if self.args.dry_run:
                 if self.work_git.rev_parse("HEAD") != self.journal["last_head"]:
                     raise KBError(
@@ -2032,7 +2174,7 @@ class PlannedBackporter(KernelBackporter):
         elif current != self.batch_plan.baseline:
             raise KBError(f"working HEAD {current} does not match plan baseline {self.batch_plan.baseline}")
         if self.worksheet is not None and not self.args.dry_run:
-            self.worksheet.synchronize(self.journal)
+            self.worksheet.synchronize(self.journal, self.engineer_decisions)
         self.upstream, self.current_ds, self.target, self.current_ds_head = self.refs.prepare()
         if self.target != self.batch_plan.target:
             raise KBError(f"upstream target differs from plan: {self.target} != {self.batch_plan.target}")
@@ -2066,9 +2208,13 @@ class PlannedBackporter(KernelBackporter):
         plan = self.batch_plan
         actual = self.work_git.rev_parse("HEAD")
         expected = self._new_journal()
-        take = sum(plan.commits[sha]["advisor_decision"] == "TAKE"
+        if self.args.worksheet:
+            self.worksheet = BackportWorksheet(self.args.worksheet, plan)
+            self.engineer_decisions = self.worksheet.engineer_decisions()
+        take = sum(self._decision(sha) == "TAKE"
                    for sha in plan.order)
         skipped = len(plan.order) - take
+        overrides = len(self.engineer_decisions)
         print(f"Plan: {plan.path}")
         print(f"Plan SHA256: {plan.digest}")
         print(f"Baseline: {plan.baseline}")
@@ -2076,8 +2222,8 @@ class PlannedBackporter(KernelBackporter):
         print(f"Journal: {self.journal_path}")
         if self.args.worksheet:
             print(f"Worksheet: {self.args.worksheet} (read-only)")
-        print(f"Planned: {take} TAKE, {skipped} SKIP/REVIEW "
-              f"({len(plan.order)} ordered entries)")
+        print(f"Effective plan: {take} TAKE, {skipped} SKIP/REVIEW "
+              f"({len(plan.order)} ordered entries; {overrides} engineer override(s))")
 
         if not self.journal_path.is_file():
             print("Status: NOT STARTED (no execution journal)")
@@ -2097,6 +2243,8 @@ class PlannedBackporter(KernelBackporter):
         except (OSError, ValueError) as exc:
             raise KBError(f"cannot read status journal: {exc}") from exc
         self._validate_journal(journal)
+        self.journal = journal
+        self._validate_engineer_overrides()
         entries = journal["entries"]
         cursor = journal["cursor"]
         blocked = journal.get("blocked")
@@ -2106,11 +2254,13 @@ class PlannedBackporter(KernelBackporter):
                       for e in entries)
         present = sum(e["status"] == "ALREADY_PRESENT" for e in entries)
         policy = sum(e["status"] == "SKIPPED_POLICY" for e in entries)
-        remaining = sum(plan.commits[sha]["advisor_decision"] == "TAKE"
+        engineer_skipped = sum(e["status"] == "SKIPPED_ENGINEER" for e in entries)
+        remaining = sum(self._decision(sha) == "TAKE"
                         for sha in plan.order[cursor:])
         print(f"Journal cursor: {cursor}/{len(plan.order)}")
         print(f"Recorded: {applied} applied, {present} already present, "
-              f"{policy} policy skipped; {remaining} TAKE pending")
+              f"{policy} policy skipped, {engineer_skipped} engineer skipped; "
+              f"{remaining} TAKE pending")
         print(f"Journal HEAD: {recorded}")
         recent = [entry for entry in entries
                   if entry["status"] in ("APPLIED", "APPLIED_MANUALLY")]
@@ -2126,7 +2276,7 @@ class PlannedBackporter(KernelBackporter):
                   f"{blocked.get('reason', 'unknown reason')}")
         next_take = next(
             (sha for sha in plan.order[cursor:]
-             if plan.commits[sha]["advisor_decision"] == "TAKE"), None)
+             if self._decision(sha) == "TAKE"), None)
         if next_take:
             print(f"Next TAKE: {next_take[:12]} "
                   f"{plan.commits[next_take].get('subject', '')}")
@@ -2218,11 +2368,22 @@ class PlannedBackporter(KernelBackporter):
             for position in range(cursor, len(self.batch_plan.order)):
                 sha = self.batch_plan.order[position]
                 rec = self.batch_plan.commits[sha]
-                decision = rec["advisor_decision"]
+                decision = self._decision(sha)
                 if decision != "TAKE":
-                    print(f"SKIP {sha[:12]}: advisor {decision}")
+                    engineer_skip = sha in self.engineer_decisions
+                    if engineer_skip:
+                        print(f"SKIP {sha[:12]}: engineer SKIP "
+                              f"(advisor {rec['advisor_decision']})")
+                    else:
+                        print(f"SKIP {sha[:12]}: advisor {decision}")
                     if not self.args.dry_run:
-                        self._append(sha, "SKIPPED_POLICY", advisor_decision=decision)
+                        if engineer_skip:
+                            self._append(sha, "SKIPPED_ENGINEER", engineer_decision="SKIP",
+                                         engineer_rationale=self.engineer_decisions[sha].get("rationale", ""),
+                                         advisor_decision=rec["advisor_decision"])
+                        else:
+                            self._append(sha, "SKIPPED_POLICY", advisor_decision=decision)
+                        self.journal["blocked"] = None
                         self._write_journal()
                     continue
                 if self._present(sha, applied):
@@ -2373,7 +2534,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
                    help="max TAKE commits attempted per plan invocation (default: 1)")
     p.add_argument("--journal", help="override plan execution journal location")
     p.add_argument("--worksheet", help="editable worksheet for an explicit --plan "
-                   "(updated in place; preserves engineer annotations)")
+                   "(updated in place; engineer-decision TAKE/SKIP overrides)")
     p.add_argument("--text-plan", help="legacy source for --progress-output snapshots")
     p.add_argument("--progress-output", help="user-chosen progress filename; never overwrite")
     p.add_argument(
