@@ -14,7 +14,7 @@ The central safety rule is simple:
 > `kernel-backporter` may add known upstream prerequisite commits, but it never
 > edits conflicted source code automatically.
 
-Current version: **0.2.8**
+Current version: **0.2.9**
 
 ## What it does
 
@@ -109,7 +109,7 @@ kernel-backporter --version
 Expected:
 
 ```text
-kernel-backporter 0.2.8
+kernel-backporter 0.2.9
 ```
 
 Every normal run also prints the version as its first line.
@@ -127,8 +127,8 @@ for the execution journal that belongs to the selected plan and repository:
 - Blocked journal plus one manual resolution commit: reconcile only if the
   new commit has the exact upstream cherry-pick provenance trailer.
 - Dirty tree, unrelated HEAD changes, hard reset, corrupt journal, or changed
-  plan: refuse execution. The worksheet's editable `// Done` lines cannot
-  override Git and the journal.
+  plan: refuse execution. Worksheet `backporter-status` and
+  `downstream-commit` fields cannot override Git and the journal.
 
 A `--dry-run` with an existing journal starts its simulated checks at the
 journal cursor but does not change the journal or living worksheet. If a
@@ -223,100 +223,109 @@ files, or audio-server connectivity never affect the exit status. To choose
 another sound directory, set `KBB_SOUND_DIR`. `--status`, `--version`, and
 help are silent.
 
-## Live Backport Worksheet (0.2.5+)
+## Live Backport Worksheet (backporter 0.2.9)
 
-The planner's JSON and frozen source baseline **never change** during
-backporting. The backporter maintains the separate `journal.json`, and updates
-only the recognized header status (`// Take`, `// Done`, `// Review (conflict)`,
-or `// Skip (engineer)`) and its own `backporter: BLOCKED` annotations.
-The advisor's technical rationale, prerequisites, and engineer's annotations
-are preserved. Add investigation and resolution notes anywhere **outside** the
-machine-owned header status and `backporter:` lines. Do not manually change
-header status comments such as `// Take` to `// Skip`: the journal and Git
-are authoritative. Use `engineer-decision:` annotations instead.
-For `APPLIED`, the worksheet records the new downstream SHA:
+`kernel-backporter` 0.2.9 consumes the field-based worksheet produced by
+`kernel-backport-planner` 0.4.30 or newer. No worksheet version number is
+required. Each executable entry has an unmodified, comment-free header and
+an `advisor: TAKE|SKIP|REVIEW` field matching
+the immutable `backport_plan.json`. Trailing `// Take`, `// Done`, and similar
+header status comments are **not supported**. The backporter reads entries
+only from the `BACKPORT WORKSHEET (oldest first)` section. Commit-like entries
+in informational appendices, such as `SAME PATCH SERIES` and
+`ALREADY DOWNSTREAM`, are not executable and are never rewritten.
+
+Three independently owned sets of fields keep provenance clear:
+
+- **Planner-owned:** commit headers, `advisor:`, `advisor-rationale:`, and
+  other dependency and platform evidence. Do not edit planner-owned fields;
+  validation checks the header order and advisor decisions against JSON.
+- **Engineer-owned (optional):** `engineer-decision: TAKE` or `SKIP`, and
+  `engineer-rationale:`. These may be edited between backporter invocations.
+- **Backporter-owned:** `backporter-status:`, `downstream-commit:`, and wrapped
+  `backporter:` conflict diagnostics. These are regenerated from the journal
+  and never accepted as proof of execution.
+
+For example, after applying a commit, the worksheet contains:
 
 ```text
-40f742b07ab2 [DEPENDENCY] ("rk3576-armsom-sige5 board") // Done 141fc6cb843e
-      advisor-rationale: ...
-      engineer-note: Built and validated on arm64
-```
-
-### Engineer decision overrides (0.2.8)
-
-The planner's `advisor: TAKE`, `SKIP`, or `REVIEW` remains intact. Before the
-backporter attempts an unprocessed commit, an engineer may add **exactly one**
-`engineer-decision: SKIP` or `engineer-decision: TAKE` annotation in that
-commit's worksheet block, optionally with `engineer-rationale:`. For example:
-
-```text
-c37393b36c1d [DEPENDENCY] ("arm64: dts: rockchip: refactor common Orange Pi 5 board") // Review (conflict)
+40f742b07ab2 [DEPENDENCY] ("rk3576-armsom-sige5 board")
       advisor: TAKE
-      advisor-rationale: Upstream refactoring needed by another candidate.
-      engineer-decision: SKIP
-      engineer-rationale: Board-specific work outside this MR's scope.
+      advisor-rationale: Relevant to the selected backport scope.
+      backporter-status: APPLIED
+      downstream-commit: 141fc6cb843e0000000000000000000000000000
 ```
 
-Use `engineer-decision: SKIP` to exclude a candidate or unblock a stopped
-preflight without changing Git or rerunning the planner. Use `TAKE` to
-explicitly include a planner `SKIP`/`REVIEW` candidate. The backporter
-respects these decisions on the next invocation, writes `SKIPPED_ENGINEER`
-entries to the journal, records the optional rationale, and annotates completed
-skips as `// Skip (engineer)`. Skips do not consume `--max-attempts`.
-The original JSON plan is never modified. `--status` shows effective pending
-decisions; `--dry-run` respects them without changing journal or worksheet.
+The displayed downstream SHA is a full Git commit identity, not an input.
+The journal stores the actual SHA and Git history must agree.
 
-**Dependency safeguard:** If a commit marked `engineer-decision: SKIP` is
-an explicit `advisor_prerequisites` dependency of a pending effective `TAKE`,
-the backporter refuses to run. Either skip the dependent commit too, restore
-the prerequisite to TAKE, or investigate whether the planner's relationship
-is truly required. The backporter does **not** silently remove a dependency
-chain or override the engineer's decision. Already completed commits cannot be
-retroactively skipped or replayed by editing the worksheet; the journal and
-Git remain authoritative. To undo an applied commit requires explicit Git
-work and a deliberately reconciled execution state, not a worksheet edit.
+### Engineer decision overrides
 
-The `backporter: BLOCKED` diagnostic is now wrapped at **80 characters per
-line**, with each continuation prefixed by `backporter:`. Long paths and
-other unbroken tokens may be split for display; the conflict dossier and
-journal retain the original values. Machine-owned diagnostic lines are
-replaced/cleared during journal synchronization, and engineer notes are
-preserved. Avoid editing the worksheet while the backporter is running.
+Before executing an unprocessed commit, add exactly one engineer decision and
+optionally an engineer rationale to that commit's worksheet block:
 
-When a cherry-pick cannot proceed, it stops, writes the existing conflict
-dossier, marks the worksheet header `Review (conflict)` or
-`Review (prerequisite)`, and adds a `backporter: BLOCKED` line showing the
-reason, paths, and dossier location when available. Read that commit's advisor
-commentary in the worksheet, inspect the dossier and Git, and add resolution
-notes. After manually committing the blocked backport with the exact upstream
-cherry-pick provenance trailer, the next normal invocation reconciles that
-commit and marks it Done. It does **not** automatically import additional prerequisites in plan
-mode. If an engineer decides to introduce additional fixes or dependencies,
-record them in Git and the worksheet; once drift grows significant, build,
-submit an incremental MR, establish a new downstream baseline, and create a
-new planning cycle. Never mutate the frozen plan to represent that work.
+```text
+c37393b36c1d [DEPENDENCY] ("arm64: dts: rockchip: refactor common Orange Pi 5 board")
+      advisor: TAKE
+      advisor-rationale: Upstream refactoring identified by the advisor.
+      engineer-decision: SKIP
+      engineer-rationale: Board-specific change outside this MR's scope.
+```
 
-Worksheet updates are atomic and preserve unrelated text. The file's commit
-headers must match the JSON order and advisor decisions; engineer overrides
-must use separate annotations. The backporter refuses to
-write if the worksheet is missing, mismatched, symlinked, or changed during
-preparation. The journal is saved before the worksheet: if a worksheet write
-fails, the applied Git commits and journal remain authoritative; repair the
-worksheet and invoke the backporter again to synchronize it before proceeding. Avoid editing
-the worksheet simultaneously with an active backporter process.
+An explicit `engineer-decision: TAKE` can promote an advisor SKIP or REVIEW.
+The original advisor recommendation stays intact. Engineer SKIPs are recorded
+in the journal as `SKIPPED_ENGINEER` with their rationale, and appear as
+`backporter-status: SKIPPED_ENGINEER` in the worksheet. Policy skips use
+`SKIPPED_POLICY`, and both kinds of skips avoid consuming `--max-attempts`.
 
-`--results-dir DIR` explicitly selects a planning cycle and takes precedence
-over workspace auto-discovery. `--plan FILE` remains available for historical
-numbered JSON plans and overrides the environment variable without silently
-selecting a worksheet. Add `--worksheet FILE` to enable in-place updates for an
-explicit plan. In single-commit mode (`-c SHA`), plan auto-discovery is ignored. `--status` never updates the worksheet or journal.
+**Dependency safeguard:** A skipped commit that appears as an explicit
+`advisor_prerequisites` prerequisite of a still-pending TAKE blocks execution.
+Restore the prerequisite to TAKE, skip the dependent commit too, or investigate
+the dependency. The tool never automatically prunes a dependency chain or
+changes the planner's JSON. Already processed journal entries cannot be
+reinterpreted by editing engineer decisions; undoing a previously applied
+commit requires deliberate Git work and journal reconciliation.
 
-A hard Git reset does **not** reset the journal or worksheet. `--status`
-reports divergence. Only after confirming the baseline and a clean tree should
-the engineer explicitly archive the stale journal; the next execution can
-then reconcile the worksheet's status annotations against its new journal.
-Keep a copy or the planner's original ZIP if historical worksheet content is
-important; this tool does not auto-backup every manual edit.
+When preflight fails, the worksheet shows:
+
+```text
+c37393b36c1d [DEPENDENCY] ("arm64: dts: rockchip: refactor common Orange Pi 5 board")
+      advisor: TAKE
+      backporter-status: BLOCKED
+      backporter: BLOCKED preflight failed: ...
+```
+
+`backporter:` diagnostics wrap at **80 columns**, including their indentation.
+The full diagnostic, file list, and dossier path remain in the journal and
+conflict dossier. After a manual Git backport with the exact upstream
+cherry-pick provenance trailer, the next ordinary invocation reconciles it
+and writes `backporter-status: APPLIED_MANUALLY` and `downstream-commit:`.
+Alternatively, an engineer may SKIP an unresolved blocker if dependency
+checks permit it, without changing Git.
+
+Worksheet updates are atomic, preserve other annotations, and remove stale
+machine-owned fields. The journal is written first; a failed worksheet write
+can be recovered on the next invocation. The backporter detects engineer
+changes during a batch and refuses to overwrite concurrently edited worksheets.
+Do not manually edit machine-owned status fields. `--status` and `--dry-run`
+never modify the worksheet or journal.
+
+A hard Git reset does not clear the journal; `--status` reports divergence.
+After verifying the baseline and deliberately archiving a stale journal, a
+new execution regenerates machine-owned worksheet status from the new journal.
+
+`--results-dir DIR` selects a completed planning cycle and its standard JSON
+and worksheet files. `--plan FILE` selects an explicit JSON plan; provide
+`--worksheet FILE` when you want the matching worksheet maintained live.
+Single-commit mode (`-c SHA`) does not use planner worksheets.
+
+**Migration note:** An old worksheet with trailing `// Take` or `// Done`
+headers must be converted to the current named-field layout using the matching
+planner JSON, without changing its advisor decisions. The backporter ignores
+and removes an obsolete `worksheet-format: 2` line when updating the worksheet.
+An existing journal can continue only if the plan digest, Git
+baseline, branch, and journal state still match. Do not swap a different plan
+into an active session or change an active worksheet during execution.
 
 ## Read-only plan status (0.2.4)
 
@@ -364,86 +373,37 @@ This is an explicit user action, not something `--status` performs. Preserve
 archived journals for historical provenance. The next real invocation will
 create a new journal for the same plan and current repository.
 
-## Legacy user-named progress snapshots (0.2.2)
-
-For older numbered `.c` reports, one-time progress snapshots remain opt-in.
-Supply `--progress-output` with a new destination
-filename on each non-dry-run invocation. The backporter does not choose or
-increment suffixes. Without that argument, no legacy progress copy is written. The preferred
-workspace workflow instead maintains one live `backport_worksheet.txt` in place.
-
-First batch:
-
-```bash
-kernel-backporter -j RHEL-223619 \
-    --plan ~/projects/rhel-223619/backport_plan_17.json \
-    --max-attempts 2 \
-    --progress-output ~/projects/rhel-223619/backport_plan_17_2.c
-```
-
-Next batch:
-
-```bash
-kernel-backporter -j RHEL-223619 \
-    --plan ~/projects/rhel-223619/backport_plan_17.json \
-    --max-attempts 2 \
-    --progress-output ~/projects/rhel-223619/backport_plan_17_3.c
-```
-
-The original `.c` and `.json` are untouched. Every progress report is rendered
-from the original text plan, with the authoritative execution journal providing
-`// Done <SHA>`, `// Done (already present)`, `// Review (conflict)`,
-`// Review (prerequisite)`, or `// Review (manual)`. Planner SKIP/REVIEW and
-original evidence remain unchanged.
-
-The destination directory must exist, and existing filenames (including
-symlinks) are never overwritten. An original text report must be present
-alongside the JSON or specified with `--text-plan FILE`. It is checked against
-the JSON order and advisor decisions before backports start. Dry runs cannot
-use `--progress-output` because they do not record execution progress. The
-journal remains authoritative; resetting Git does not reset that journal.
-
 ## Plan-driven backports (0.2.0)
 
-Version 0.2.0 introduces a separate, bounded execution mode for JSON output from
-`kernel-backport-planner` 0.4.13 or later. **The planner remains authoritative
-for commit selection**. `kernel-backporter` never selects new dependencies in
-this mode, even if the older single-commit discovery logic could find one.
-
-Produce a human-readable report and matching JSON in a single planner run:
-
-```bash
-kernel-backport-planner ... \
-    --output ~/projects/rhel-223619/backport_plan_17.c \
-    --json-output ~/projects/rhel-223619/backport_plan_17.json
-```
+Plan mode executes bounded batches from immutable JSON generated by the
+planner. The planner supplies candidate decisions, the engineer may override
+those through the named-field worksheet, and `kernel-backporter` never invents new
+dependencies in plan mode. Generate a matching `backport_plan.json` and
+`backport_worksheet.txt` with `kernel-backport-planner` 0.4.30 or newer.
 
 Start on the same clean CS10 tree and at the exact downstream commit recorded in
-`downstream`/`replay_start` in that JSON. For the RHEL-223619 plan:
+`downstream`/`replay_start` in the JSON. With a completed numbered planning
+cycle and its worksheet:
 
 ```bash
-cd ~/projects/rhel-223619/centos-stream-10
+cd "$KERNEL_WORKSPACE_DIR/centos-stream-$CS_VERSION"
+PLAN_DIR="$KERNEL_WORKSPACE_DIR/backport-plans/backport_plan_01"
+
+# Preview the next six TAKE attempts without changing Git or the journal.
 kernel-backporter -j RHEL-223619 \
-    --plan ~/projects/rhel-223619/backport_plan_17.json \
-    --max-attempts 5 --dry-run
+    --results-dir "$PLAN_DIR" --max-attempts 6 --dry-run
+
+# Apply a reviewed batch, then inspect the journal and worksheet.
+kernel-backporter -j RHEL-223619 \
+    --results-dir "$PLAN_DIR" --max-attempts 6
+kernel-backporter --results-dir "$PLAN_DIR" --status
 ```
 
-When ready to apply a **small, reviewed batch**, omit `--dry-run`:
-
-```bash
-kernel-backporter -j RHEL-223619 \
-    --plan ~/projects/rhel-223619/backport_plan_17.json \
-    --max-attempts 5
-```
-
-Continue from the persisted journal, without touching commits that were already
-completed:
-
-```bash
-kernel-backporter -j RHEL-223619 \
-    --plan ~/projects/rhel-223619/backport_plan_17.json \
-    --max-attempts 5
-```
+Repeating the same apply command continues from the persisted journal.
+Without `--results-dir`, the newest completed planning cycle is discovered
+from `$KERNEL_WORKSPACE_DIR/backport-plans` (subject to the unfinished-cycle
+safety guard). For an explicit JSON path, use `--plan FILE` and optionally
+`--worksheet FILE` to synchronize its matching worksheet.
 
 `--max-attempts` counts **eligible TAKE attempts**, including a failed preflight,
 not successful commits; its default is one. Policy SKIP and REVIEW entries,
@@ -809,7 +769,9 @@ upstream-prerequisite replay is no longer sufficient.
     recorded in reports. Plan mode obtains its target from the validated JSON.
 
 --repo PATH
-    Downstream working repository. Default: $KERNEL_SRC_DIR, then current directory.
+    Downstream working repository. Default: workspace/centos-stream-$CS_VERSION
+    when KERNEL_WORKSPACE_DIR and CS_VERSION are set, then $KERNEL_SRC_DIR,
+    then current directory.
 
 --reference-root PATH
     Tool-managed reference repositories. Default precedence:

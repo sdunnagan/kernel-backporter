@@ -101,10 +101,10 @@ class PlanModeBase(unittest.TestCase):
         return result, output.getvalue()
 
     def text_template(self):
-        lines = ["BACKPORT PLAN (oldest first)", "=" * 80]
+        lines = ["BACKPORT WORKSHEET (oldest first)", "=" * 80]
         for sha, label in ((self.a, "A"), (self.b, "B"), (self.c, "C")):
             decision = json.loads(self.planfile.read_text())["commits"][sha]["advisor_decision"]
-            lines.append(f'{sha[:12]} [DEPENDENCY] ("{label}") // {decision.capitalize()}')
+            lines.append(f'{sha[:12]} [DEPENDENCY] ("{label}")')
             lines.append(f"      advisor: {decision}")
             lines.append("      advisor-rationale: unmodified evidence")
         lines += ["", "SAME PATCH SERIES", "=" * 80, "unchanged appendix"]
@@ -274,14 +274,7 @@ class PlanModeTests(PlanModeBase):
                 "advisor_decision": "TAKE", "advisor_prerequisites": []
             }}
         }))
-        (self.root / "plan.c").write_text(
-            "BACKPORT PLAN (oldest first)\n" + "=" * 80 + "\n" +
-            f'{conflicting[:12]} [DEPENDENCY] ("conflicting patch") // Take\n' +
-            "      advisor: TAKE\n"
-        )
-        self.assertEqual(self.run_plan("--max-attempts", "2",
-                                       "--progress-output", str(self.root / "plan_2.c")), 2)
-        self.assertIn("// Review (conflict)", (self.root / "plan_2.c").read_text())
+        self.assertEqual(self.run_plan("--max-attempts", "2"), 2)
         self.assertEqual(git(self.work, "rev-parse", "HEAD"), newbase)
         self.assertEqual((self.work / "base.txt").read_text(), "downstream\n")
         state = json.loads(self.journals()[0].read_text())
@@ -396,159 +389,16 @@ class PlanModeTests(PlanModeBase):
         with self.assertRaisesRegex(kb.KBError, "does not match plan baseline"):
             self.run_plan()
 
-    def snapshots(self):
-        return sorted(self.root.glob("plan_*.c"))
-
-    def test_explicit_progress_outputs_preserve_source_and_continue(self):
-        original = self.text_template().read_bytes()
-        self.assertEqual(self.run_plan("--max-attempts", "2", "--progress-output",
-                                       str(self.root / "plan_2.c")), 0)
-        self.assertEqual([p.name for p in self.snapshots()], ["plan_2.c"])
-        first = self.snapshots()[0].read_text()
-        entries = json.loads(self.journals()[0].read_text())["entries"]
-        self.assertIn(f"{self.a[:12]} [DEPENDENCY]", first)
-        self.assertIn(f"// Done {entries[0]['downstream_sha'][:12]}", first)
-        self.assertIn(f"// Done {entries[1]['downstream_sha'][:12]}", first)
-        self.assertIn(f'{self.c[:12]} [DEPENDENCY] ("C") // Take', first)
-        self.assertIn("advisor-rationale: unmodified evidence", first)
-        self.assertEqual(self.run_plan( "--max-attempts", "1",
-                                       "--progress-output", str(self.root / "plan_3.c")), 0)
-        self.assertEqual([p.name for p in self.snapshots()], ["plan_2.c", "plan_3.c"])
-        self.assertEqual(self.snapshots()[0].read_text(), first)
-        self.assertEqual(self.text_template().read_bytes(), original)
-        self.assertEqual(self.snapshots()[1].read_text().count("// Done "), 3)
-        self.assertIn("unchanged appendix", self.snapshots()[1].read_text())
-
-    def test_dry_run_produces_no_snapshot(self):
-        self.text_template()
-        self.assertEqual(self.run_plan("--dry-run", "--max-attempts", "2"), 0)
-        self.assertFalse(self.snapshots())
-        self.assertFalse(self.journals())
-
-    def test_blocked_prerequisite_snapshot_marks_review(self):
-        self.build_plan(prereqs={self.c: [self.b]})
-        # Prior advisor decision SKIP must remain unchanged in the original.
-        self.build_plan(decisions={self.b: "SKIP"}, prereqs={self.c: [self.b]})
-        self.text_template()
-        self.assertEqual(self.run_plan("--max-attempts", "5",
-                                       "--progress-output", str(self.root / "plan_2.c")), 2)
-        snapshot = self.snapshots()[0].read_text()
-        self.assertIn(f'{self.b[:12]} [DEPENDENCY] ("B") // Skip', snapshot)
-        self.assertIn(f'{self.c[:12]} [DEPENDENCY] ("C") // Review (prerequisite)', snapshot)
-        self.assertIn("      advisor: TAKE", snapshot)
-
-    def test_snapshot_conflict_reason_and_manual_resolution(self):
-        self.build_plan(prereqs={self.a: [self.c]})
-        self.text_template()
-        self.assertEqual(self.run_plan("--progress-output", str(self.root / "plan_2.c")), 2)
-        first = self.snapshots()[0].read_text()
-        self.assertIn(f'{self.a[:12]} [DEPENDENCY] ("A") // Review (prerequisite)', first)
-        (self.work / "a.txt").write_text("manual change\n")
-        git(self.work, "add", "a.txt")
-        git(self.work, "commit", "-m", f"manual A\n\n(cherry picked from commit {self.a})")
-        self.assertEqual(self.run_plan( "--max-attempts", "1",
-                                       "--progress-output", str(self.root / "plan_3.c")), 0)
-        second = self.snapshots()[1].read_text()
-        state = json.loads(self.journals()[0].read_text())
-        self.assertIn(f"// Done {state['entries'][0]['downstream_sha'][:12]}", second)
-
-    def test_existing_output_refuses_before_backports(self):
-        self.text_template()
-        previous = self.root / "plan_2.c"
-        previous.write_text("historical snapshot\n")
-        with self.assertRaisesRegex(kb.KBError, "already exists"):
-            self.run_plan("--progress-output", str(previous))
-        self.assertEqual(previous.read_text(), "historical snapshot\n")
-        self.assertFalse(self.journals())
-        self.assertEqual(git(self.work, "rev-parse", "HEAD"), self.base)
-        self.assertFalse((self.root / "plan_3.c").exists())
-
-    def test_mismatched_text_plan_rejected_before_any_backports(self):
-        source = self.text_template()
-        source.write_text(source.read_text().replace(self.a[:12], "0" * 12, 1))
-        with self.assertRaisesRegex(kb.KBError, "does not match JSON order"):
-            self.run_plan("--progress-output", str(self.root / "plan_2.c"))
-        self.assertFalse(self.journals())
-        self.assertEqual(git(self.work, "rev-parse", "HEAD"), self.base)
-
-    def test_mismatched_policy_rejected(self):
-        source = self.text_template()
-        source.write_text(source.read_text().replace("// Take", "// Skip", 1))
-        with self.assertRaisesRegex(kb.KBError, "differs from JSON"):
-            self.run_plan("--progress-output", str(self.root / "plan_2.c"))
-        self.assertFalse(self.journals())
-
-    def test_text_plan_flag_requires_existing_file(self):
-        with self.assertRaisesRegex(kb.KBError, "text report not found"):
-            self.run_plan("--text-plan", str(self.root / "missing.c"),
-                          "--progress-output", str(self.root / "plan_2.c"))
-        self.assertFalse(self.journals())
-
-    def test_renderer_mark_already_present_without_inventing_sha(self):
-        source = self.text_template()
-        plan = kb.BackportPlan.load(str(self.planfile))
-        renderer = kb.PlanTextProgress(source, plan)
-        text = renderer.render(plan, {"entries": [
-            {"sha": self.a, "status": "ALREADY_PRESENT"}], "blocked": None})
-        self.assertIn(f'{self.a[:12]} [DEPENDENCY] ("A") // Done (already present)', text)
-
-    def test_no_progress_output_is_default(self):
+    def test_explicit_plan_without_worksheet_remains_json_only(self):
         self.text_template()
         self.assertEqual(self.run_plan("--max-attempts", "2"), 0)
-        self.assertFalse(self.snapshots())
         self.assertEqual(json.loads(self.journals()[0].read_text())["cursor"], 2)
 
-    def test_user_chosen_names_are_not_incremented(self):
-        self.text_template()
-        first = self.root / "checkpoint_alpha.txt"
-        second = self.root / "checkpoint_beta.c"
-        self.assertEqual(self.run_plan("--progress-output", str(first)), 0)
-        old = first.read_bytes()
-        self.assertEqual(self.run_plan( "--progress-output", str(second)), 0)
-        self.assertEqual(first.read_bytes(), old)
-        self.assertIn("// Done ", second.read_text())
-        self.assertFalse(self.snapshots())
-
-    def test_rejects_output_equal_to_original_or_json(self):
-        original = self.text_template()
-        for dest in (original, self.planfile):
-            with self.subTest(dest=dest):
-                with self.assertRaisesRegex(kb.KBError, "already exists"):
-                    self.run_plan("--progress-output", str(dest))
-                self.assertFalse(self.journals())
-
-    def test_rejects_missing_output_directory(self):
-        self.text_template()
-        with self.assertRaisesRegex(kb.KBError, "directory does not exist"):
-            self.run_plan("--progress-output", str(self.root / "absent" / "copy.c"))
-        self.assertFalse(self.journals())
-
-    def test_json_only_plan_does_not_require_text(self):
-        self.assertEqual(self.run_plan(), 0)
-        self.assertFalse(self.snapshots())
-
-    def test_rejects_dry_run_with_progress_output(self):
-        self.text_template()
-        with self.assertRaises(SystemExit) as raised:
-            self.run_plan("--dry-run", "--progress-output", str(self.root / "test.c"))
-        self.assertEqual(raised.exception.code, 2)
-        self.assertFalse(self.journals())
-
-    def test_text_plan_requires_output(self):
-        self.text_template()
-        with self.assertRaises(SystemExit) as raised:
-            self.run_plan("--text-plan", str(self.root / "plan.c"))
-        self.assertEqual(raised.exception.code, 2)
-        self.assertFalse(self.journals())
-
-    def test_dangling_symlink_is_not_overwritten(self):
-        self.text_template()
-        dest = self.root / "dangling.c"
-        dest.symlink_to(self.root / "not-here")
-        with self.assertRaisesRegex(kb.KBError, "already exists"):
-            self.run_plan("--progress-output", str(dest))
-        self.assertTrue(dest.is_symlink())
-        self.assertFalse(self.journals())
+    def test_legacy_progress_flags_are_no_longer_accepted(self):
+        for flag in ("--text-plan", "--progress-output"):
+            with self.subTest(flag=flag), self.assertRaises(SystemExit) as raised:
+                kb.parse_args(self.args(flag, str(self.root / "legacy.c")))
+            self.assertEqual(raised.exception.code, 2)
 
     def test_validates_json(self):
         p = self.build_plan()
@@ -695,9 +545,9 @@ class WorksheetIntegrationTests(PlanModeBase):
         after = self.worksheet.read_text()
         journal = json.loads(self.journals()[0].read_text())
         self.assertEqual(len(journal["entries"]), 2)
-        self.assertIn("// Done " + journal["entries"][0]["downstream_sha"][:12], after)
-        self.assertIn("// Done " + journal["entries"][1]["downstream_sha"][:12], after)
-        self.assertIn(f'{self.c[:12]} [DEPENDENCY] ("C") // Take', after)
+        self.assertIn("      downstream-commit: " + journal["entries"][0]["downstream_sha"], after)
+        self.assertIn("      downstream-commit: " + journal["entries"][1]["downstream_sha"], after)
+        self.assertIn(f'{self.c[:12]} [DEPENDENCY] ("C")', after)
         self.assertIn("advisor-rationale: unmodified evidence", after)
         self.assertNotEqual(after, initial)
         self.assertEqual((self.results / "backport_plan.json").read_bytes(), original_plan)
@@ -714,7 +564,7 @@ class WorksheetIntegrationTests(PlanModeBase):
         after = self.worksheet.read_text()
         self.assertIn(note, after)
         self.assertIn("Investigation summary: keep for MR", after)
-        self.assertEqual(after.count("// Done "), 3)
+        self.assertEqual(after.count("      backporter-status: APPLIED"), 3)
         original = after
         # A second read-only sync with the identical journal changes nothing.
         worksheet = kb.BackportWorksheet(str(self.worksheet),
@@ -727,7 +577,8 @@ class WorksheetIntegrationTests(PlanModeBase):
         (self.results / "backport_plan.json").write_bytes(self.planfile.read_bytes())
         self.assertEqual(self.dir_run("--max-attempts", "2"), 2)
         text = self.worksheet.read_text()
-        self.assertIn(f'{self.a[:12]} [DEPENDENCY] ("A") // Review (prerequisite)', text)
+        self.assertIn(f'{self.a[:12]} [DEPENDENCY] ("A")', text)
+        self.assertIn("      backporter-status: BLOCKED", text)
         self.assertIn("backporter: BLOCKED unresolved advisor prerequisite(s):", text)
         self.assertIn("advisor-rationale: unmodified evidence", text)
         # The engineer resolves and commits the selected blocked backport.
@@ -738,7 +589,8 @@ class WorksheetIntegrationTests(PlanModeBase):
                                   "\nEngineer notes: dependency C investigated\n")
         self.assertEqual(self.dir_run( "--max-attempts", "1"), 0)
         text = self.worksheet.read_text()
-        self.assertIn(f'{self.a[:12]} [DEPENDENCY] ("A") // Done ', text)
+        self.assertIn("      backporter-status: APPLIED_MANUALLY", text)
+        self.assertIn("      downstream-commit: " + git(self.work, "rev-parse", "HEAD"), text)
         self.assertNotIn("backporter: BLOCKED", text)
         self.assertIn("Engineer notes: dependency C investigated", text)
 
@@ -788,7 +640,7 @@ class WorksheetIntegrationTests(PlanModeBase):
         # Existing plans can opt into the new live worksheet mechanism.
         original = self.text_template()
         self.assertEqual(self.run_plan("--worksheet", str(original), "--max-attempts", "1"), 0)
-        self.assertIn("// Done ", original.read_text())
+        self.assertIn("      backporter-status: APPLIED", original.read_text())
 
     def test_reject_missing_or_mismatched_worksheet_before_journal(self):
         self.worksheet.unlink()
@@ -824,34 +676,177 @@ class WorksheetIntegrationTests(PlanModeBase):
 
     def test_new_execution_after_reset_reconciles_old_done_annotations(self):
         self.assertEqual(self.dir_run("--max-attempts", "2"), 0)
-        self.assertEqual(self.worksheet.read_text().count("// Done "), 2)
+        self.assertEqual(self.worksheet.read_text().count("      backporter-status: APPLIED"), 2)
         git(self.work, "reset", "--hard", self.base)
         journal = self.journals()[0]
         journal.rename(journal.with_suffix(".json.archived"))
         self.assertEqual(self.dir_run("--max-attempts", "1"), 0)
         # A historical Done header does not make an upstream commit complete.
         after = self.worksheet.read_text()
-        self.assertEqual(after.count("// Done "), 1)
-        self.assertIn(f'{self.b[:12]} [DEPENDENCY] ("B") // Take', after)
-        self.assertIn(f'{self.c[:12]} [DEPENDENCY] ("C") // Take', after)
+        self.assertEqual(after.count("      backporter-status: APPLIED"), 1)
+        self.assertIn(f'{self.b[:12]} [DEPENDENCY] ("B")', after)
+        self.assertIn(f'{self.c[:12]} [DEPENDENCY] ("C")', after)
         self.assertEqual(json.loads(self.journals()[0].read_text())["cursor"], 1)
 
-    def test_manual_done_does_not_control_execution(self):
-        forged = "// Done " + "f" * 12
-        self.worksheet.write_text(self.worksheet.read_text().replace(
-            f'{self.a[:12]} [DEPENDENCY] ("A") // Take',
-            f'{self.a[:12]} [DEPENDENCY] ("A") {forged}'))
+    def test_forged_machine_status_does_not_control_execution(self):
+        text = self.worksheet.read_text()
+        self.worksheet.write_text(text.replace(
+            f'{self.a[:12]} [DEPENDENCY] ("A")\n',
+            f'{self.a[:12]} [DEPENDENCY] ("A")\n'
+            "      backporter-status: APPLIED\n"
+            "      downstream-commit: " + "f" * 40 + "\n", 1))
         self.assertEqual(self.dir_run("--max-attempts", "1"), 0)
         journal = json.loads(self.journals()[0].read_text())
         self.assertEqual(journal["cursor"], 1)
         self.assertEqual(journal["entries"][0]["sha"], self.a)
-        self.assertNotIn(forged, self.worksheet.read_text())
+        text = self.worksheet.read_text()
+        self.assertNotIn("f" * 40, text)
+        self.assertIn("      downstream-commit: " + journal["entries"][0]["downstream_sha"], text)
 
-    def test_edited_status_cannot_override_plan_or_journal(self):
-        self.worksheet.write_text(self.worksheet.read_text().replace("// Take", "// Skip", 1))
-        with self.assertRaisesRegex(kb.KBError, "contradicts"):
+    def test_edited_advisor_cannot_override_plan(self):
+        self.worksheet.write_text(self.worksheet.read_text().replace(
+            "      advisor: TAKE", "      advisor: SKIP", 1))
+        with self.assertRaisesRegex(kb.KBError, "worksheet advisor"):
             self.dir_run()
         self.assertFalse(self.journals())
+
+    def test_obsolete_format_marker_is_optional_and_removed_on_write(self):
+        # Accept previously produced worksheets without requiring the user to
+        # understand worksheet schema versions. Normalize on a journal write.
+        original = self.worksheet.read_text()
+        self.worksheet.write_text("worksheet-format: 2\n\n" + original)
+        self.assertEqual(self.dir_run("--max-attempts", "1"), 0)
+        text = self.worksheet.read_text()
+        self.assertNotIn("worksheet-format: 2", text)
+        self.assertIn("      backporter-status: APPLIED", text)
+
+    def test_section_heading_is_required_and_unique(self):
+        original = self.worksheet.read_text()
+        self.worksheet.write_text(original.replace(
+            "BACKPORT WORKSHEET (oldest first)", "BACKPORT ANALYSIS", 1))
+        with self.assertRaisesRegex(kb.KBError, "BACKPORT WORKSHEET"):
+            self.dir_run()
+        self.worksheet.write_text(
+            "BACKPORT WORKSHEET (oldest first)\n" + original)
+        with self.assertRaisesRegex(kb.KBError, "exactly one BACKPORT WORKSHEET"):
+            self.dir_run()
+        self.assertFalse(self.journals())
+
+    def test_informational_commit_headers_outside_worksheet_are_preserved(self):
+        # The real planner appends SAME PATCH SERIES and ALREADY DOWNSTREAM
+        # sections with commit-shaped lines that must not be executed.
+        appendix = (
+            "\nSAME PATCH SERIES (informational)\n" + "=" * 80 + "\n"
+            + f'{self.a[:12]} [DEPENDENCY] ("A")\n'
+            + "      engineer-decision: SKIP\n"
+            + "      backporter-status: DO_NOT_TOUCH\n"
+            + "\nALREADY DOWNSTREAM\n" + "=" * 80 + "\n"
+            + f'{self.b[:12]} [DEPENDENCY] ("B")\n'
+            + "      advisor: REVIEW\n"
+            + "      downstream-commit: informational\n"
+        )
+        # Replace the fake appendix from the fixture with richer report data.
+        source = self.worksheet.read_text()
+        source = source[:source.index("\nSAME PATCH SERIES")]
+        self.worksheet.write_text(source + appendix)
+        self.assertEqual(self.dir_run("--max-attempts", "1"), 0)
+        text = self.worksheet.read_text()
+        self.assertTrue(text.endswith(appendix))
+        self.assertIn("      backporter-status: APPLIED", text)
+        # A second run must not interpret the appendix SKIP as an override.
+        self.assertEqual(self.dir_run("--max-attempts", "1"), 0)
+        self.assertTrue(self.worksheet.read_text().endswith(appendix))
+        self.assertEqual(json.loads(self.journals()[0].read_text())["cursor"], 2)
+
+    def test_malformed_header_in_main_worksheet_is_rejected(self):
+        original = self.worksheet.read_text()
+        self.worksheet.write_text(original.replace(
+            f'{self.b[:12]} [DEPENDENCY] ("B")',
+            f'{self.b[:12]} [DEPENDENCY] ("B") // Skip', 1))
+        with self.assertRaisesRegex(kb.KBError, "do not match plan JSON order"):
+            self.dir_run()
+        self.assertFalse(self.journals())
+
+    def test_rejects_duplicate_or_missing_advisor(self):
+        original = self.worksheet.read_text()
+        self.worksheet.write_text(original.replace(
+            "      advisor: TAKE\n", "      advisor: TAKE\n      advisor: TAKE\n", 1))
+        with self.assertRaisesRegex(kb.KBError, "duplicate advisor"):
+            self.dir_run()
+        self.worksheet.write_text(original.replace("      advisor: TAKE\n", "", 1))
+        with self.assertRaisesRegex(kb.KBError, "worksheet advisor"):
+            self.dir_run()
+
+    def test_old_comment_headers_are_rejected(self):
+        self.worksheet.write_text(self.worksheet.read_text().replace(
+            f'{self.a[:12]} [DEPENDENCY] ("A")',
+            f'{self.a[:12]} [DEPENDENCY] ("A") // Take', 1))
+        with self.assertRaisesRegex(kb.KBError, "do not match plan JSON order"):
+            self.dir_run()
+        self.assertFalse(self.journals())
+
+    def test_named_execution_fields_are_managed_and_idempotent(self):
+        plan = kb.BackportPlan.load(str(self.results / "backport_plan.json"))
+        worksheet = kb.BackportWorksheet(str(self.worksheet), plan)
+        sample = {"entries": [
+            {"sha": self.a, "status": "APPLIED", "downstream_sha": "a" * 40},
+            {"sha": self.b, "status": "SKIPPED_POLICY"},
+        ], "blocked": {"sha": self.c, "reason": "manual inspection required"}}
+        stale = self.worksheet.read_text().replace(
+            f'{self.a[:12]} [DEPENDENCY] ("A")\n',
+            f'{self.a[:12]} [DEPENDENCY] ("A")\n'
+            '      backporter-status: BOGUS\n'
+            '      downstream-commit: ' + 'f' * 40 + '\n'
+            '      backporter: BLOCKED stale message\n', 1)
+        self.worksheet.write_text(stale)
+        self.assertTrue(worksheet.synchronize(sample))
+        text = self.worksheet.read_text()
+        self.assertNotIn("BOGUS", text)
+        self.assertNotIn("stale message", text)
+        self.assertNotIn("f" * 40, text)
+        self.assertIn("      backporter-status: APPLIED", text)
+        self.assertIn("      downstream-commit: " + "a" * 40, text)
+        self.assertIn("      backporter-status: SKIPPED_POLICY", text)
+        self.assertIn("      backporter-status: BLOCKED", text)
+        self.assertIn("      backporter: BLOCKED manual inspection required", text)
+        self.assertEqual(text.count("      backporter-status:"), 3)
+        self.assertIn("\nSAME PATCH SERIES\n", text)
+        self.assertFalse(worksheet.synchronize(sample))
+        sample["blocked"] = None
+        self.assertTrue(worksheet.synchronize(sample))
+        cleaned = self.worksheet.read_text()
+        self.assertNotIn("      backporter-status: BLOCKED", cleaned)
+        self.assertNotIn("      backporter: BLOCKED", cleaned)
+        self.assertNotIn("      downstream-commit: " + "f" * 40, cleaned)
+
+    def test_already_present_and_manual_completion_rendering(self):
+        plan = kb.BackportPlan.load(str(self.results / "backport_plan.json"))
+        worksheet = kb.BackportWorksheet(str(self.worksheet), plan)
+        sample = {"entries": [
+            {"sha": self.a, "status": "ALREADY_PRESENT"},
+            {"sha": self.b, "status": "APPLIED_MANUALLY", "downstream_sha": "b" * 40},
+            {"sha": self.c, "status": "SKIPPED_ENGINEER"},
+        ], "blocked": None}
+        self.assertTrue(worksheet.synchronize(sample))
+        text = self.worksheet.read_text()
+        for status in ("ALREADY_PRESENT", "APPLIED_MANUALLY", "SKIPPED_ENGINEER"):
+            self.assertIn("      backporter-status: " + status, text)
+        self.assertEqual(text.count("      downstream-commit:"), 1)
+        self.assertIn("      downstream-commit: " + "b" * 40, text)
+        self.assertFalse(worksheet.synchronize(sample))
+
+    def test_non_decision_annotations_preserved_with_crlf(self):
+        text = self.worksheet.read_text()
+        text = text.replace(
+            "      advisor-rationale: unmodified evidence\n",
+            "      advisor-rationale: unmodified evidence\n"
+            "      engineer-note: reviewed with product team\n", 1)
+        self.worksheet.write_bytes(text.replace("\n", "\r\n").encode())
+        self.assertEqual(self.dir_run("--max-attempts", "1"), 0)
+        raw = self.worksheet.read_bytes()
+        self.assertIn(b"      engineer-note: reviewed with product team\r\n", raw)
+        self.assertIn(b"      backporter-status: APPLIED\r\n", raw)
+        self.assertNotIn(b"\n", raw.replace(b"\r\n", b""))
 
     def test_invalid_combinations_and_missing_env(self):
         from unittest import mock
@@ -887,7 +882,7 @@ class WorksheetIntegrationTests(PlanModeBase):
         self.assertEqual(state["entries"][1]["engineer_rationale"],
                          "Not in the chosen product scope")
         self.assertEqual(git(self.work, "rev-list", "--count", f"{self.base}..HEAD"), "1")
-        self.assertIn(f'{self.b[:12]} [DEPENDENCY] ("B") // Skip (engineer)',
+        self.assertIn("      backporter-status: SKIPPED_ENGINEER",
                       self.worksheet.read_text())
         self.assertIn("      advisor: TAKE", self.worksheet.read_text())
         self.assertEqual((self.results / "backport_plan.json").read_bytes(), original)
@@ -910,7 +905,7 @@ class WorksheetIntegrationTests(PlanModeBase):
         self.build_plan(prereqs={self.a: [self.c]})
         (self.results / "backport_plan.json").write_bytes(self.planfile.read_bytes())
         self.assertEqual(self.dir_run("--max-attempts", "2"), 2)
-        self.assertIn("// Review (prerequisite)", self.worksheet.read_text())
+        self.assertIn("      backporter-status: BLOCKED", self.worksheet.read_text())
         self.annotate(self.a, "SKIP", "Board not in backport scope")
         self.assertEqual(self.dir_run("--max-attempts", "2"), 0)
         state = json.loads(self.journals()[0].read_text())
@@ -918,7 +913,7 @@ class WorksheetIntegrationTests(PlanModeBase):
         self.assertIsNone(state["blocked"])
         self.assertEqual([e["status"] for e in state["entries"]],
                          ["SKIPPED_ENGINEER", "APPLIED", "APPLIED"])
-        self.assertIn("// Skip (engineer)", self.worksheet.read_text())
+        self.assertIn("      backporter-status: SKIPPED_ENGINEER", self.worksheet.read_text())
         self.assertNotIn("backporter: BLOCKED", self.worksheet.read_text())
 
     def test_skipping_required_prerequisite_refused_before_mutation(self):
@@ -1133,7 +1128,7 @@ class WorkspaceDiscoveryTests(WorkspaceTestFixtures):
                           output.getvalue())
             self.assertIn("NOT STARTED", output.getvalue())
             self.assertEqual(kb.main(self.auto_args("--max-attempts", "2")), 0)
-            self.assertIn("// Done ", self.worksheet.read_text())
+            self.assertIn("      backporter-status: APPLIED", self.worksheet.read_text())
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(kb.main(self.auto_args("--status")), 0)
 

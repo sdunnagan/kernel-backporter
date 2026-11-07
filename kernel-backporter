@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
 
-VERSION = "0.2.8"
+VERSION = "0.2.9"
 
 
 HEX40 = r"[0-9a-fA-F]{40}"
@@ -1504,114 +1504,29 @@ class BackportPlan:
                    payload["target"], list(order), commits)
 
 
-class PlanTextProgress:
-    """Render a user-named progress copy of the original planner text report.
-
-    The JSON controls plan order and policy, while the execution journal controls
-    completion status. The original human-readable text is never modified.
-    """
-
-    HEADER_RE = re.compile(
-        r'^(?P<sha>[0-9a-f]{12}) (?:\[[^\]\n]+\] )?\(.*?\) '
-        r'(?P<comment>// (?P<decision>Take|Skip|Review))$', re.MULTILINE
-    )
-
-    def __init__(self, source: Path, plan: BackportPlan):
-        self.source = source
-        try:
-            self.original = source.read_text()
-        except OSError as exc:
-            raise KBError(f"cannot read planner text report {source}: {exc}") from exc
-        self.matches = list(self.HEADER_RE.finditer(self.original))
-        actual = [m.group("sha") for m in self.matches]
-        expected = [sha[:12] for sha in plan.order]
-        if actual != expected:
-            raise KBError(
-                f"planner text report {source} does not match JSON order "
-                f"({len(actual)} text entries versus {len(expected)} JSON entries)"
-            )
-        for match, sha in zip(self.matches, plan.order):
-            decision = plan.commits[sha]["advisor_decision"].capitalize()
-            if match.group("decision") != decision:
-                raise KBError(
-                    f"planner text report decision for {sha[:12]} differs "
-                    "from JSON; refusing to annotate mismatched plans"
-                )
-
-    @staticmethod
-    def _review_reason(reason: str) -> str:
-        if reason.startswith(("preflight failed:",
-                              "unexpected real-tree cherry-pick failure:")):
-            return "Review (conflict)"
-        if reason.startswith("unresolved advisor prerequisite(s):"):
-            return "Review (prerequisite)"
-        return "Review (manual)"
-
-    def render(self, plan: BackportPlan, journal: dict) -> str:
-        entries = {entry["sha"]: entry for entry in journal["entries"]}
-        blocked = journal.get("blocked")
-        chunks = []
-        prev = 0
-        for sha, match in zip(plan.order, self.matches):
-            chunks.append(self.original[prev:match.start("comment")])
-            status = match.group("comment")
-            entry = entries.get(sha)
-            if entry and entry["status"] in ("APPLIED", "APPLIED_MANUALLY"):
-                downstream = entry.get("downstream_sha")
-                if not isinstance(downstream, str) or not SHA40_RE.fullmatch(downstream):
-                    raise KBError(f"journal is missing downstream SHA for {sha}")
-                status = "// Done " + downstream[:12]
-            elif entry and entry["status"] == "ALREADY_PRESENT":
-                status = "// Done (already present)"
-            elif blocked and blocked.get("sha") == sha:
-                status = "// " + self._review_reason(blocked.get("reason", ""))
-            chunks.append(status)
-            prev = match.end("comment")
-        chunks.append(self.original[prev:])
-        return "".join(chunks)
-
-    def write_to(self, destination: Path, plan: BackportPlan, journal: dict) -> Path:
-        """Publish the user-named report atomically, without replacing files."""
-        rendered = self.render(plan, journal)
-        fd, temporary = tempfile.mkstemp(prefix=".backport-progress-",
-                                          dir=destination.parent)
-        try:
-            with os.fdopen(fd, "w") as output:
-                output.write(rendered)
-                output.flush()
-                os.fsync(output.fileno())
-            try:
-                os.link(temporary, destination)
-            except FileExistsError as exc:
-                raise KBError(f"progress output already exists: {destination}") from exc
-            except OSError as exc:
-                raise KBError(f"cannot create progress output {destination}: {exc}") from exc
-            return destination
-        finally:
-            Path(temporary).unlink(missing_ok=True)
-
-
 class BackportWorksheet:
-    """Maintain a live engineer-editable worksheet from journal state.
+    """Synchronize the planner's field-based worksheet with the journal.
 
-    The immutable JSON contains the advisor recommendations and plan order.
-    An explicit engineer-decision annotation can override TAKE/SKIP policy,
-    but never edit completed journal entries or source trees. The journal
-    remains the authoritative record of execution progress. All other text
-    is preserved, including annotations inserted by the engineer.
+    Commit headers are immutable identities, advisor fields are planner-owned,
+    and engineer-decision / engineer-rationale are optional user inputs. The
+    backporter owns backporter-status, downstream-commit, and backporter: notes.
+    Neither the visible execution fields nor engineer annotations can replace
+    the authoritative Git tree, immutable plan JSON, or journal.
     """
 
     HEADER_RE = re.compile(
-        r'^(?P<prefix>[0-9a-f]{12} (?:\[[^\]\n]+\] )?\(.*?\) )'
-        r'// (?P<status>Take|Skip(?: \(engineer\))?|Review(?: \([^\n)]*\))?|'
-        r'Done(?: [0-9a-f]{12,40}| \(already present\)))$'
+        r'^(?P<sha>[0-9a-f]{12})(?: \[[^\]\n]+\])? \(".*"\)$'
     )
-    MANAGED_RE = re.compile(r"^      backporter: (?:BLOCKED\b|  )")
+    WORKSHEET_HEADING = "BACKPORT WORKSHEET (oldest first)"
+    OBSOLETE_FORMAT_LINE = "worksheet-format: 2"
+    MANAGED_RE = re.compile(
+        r"^      (?:backporter-status:|downstream-commit:|backporter:)"
+    )
     ENGINEER_RE = re.compile(r"^      engineer-decision: (.*)$")
     ENGINEER_RATIONALE_RE = re.compile(r"^      engineer-rationale: (.*)$")
+    ADVISOR_RE = re.compile(r"^      advisor: (.*)$")
 
     def __init__(self, filename: str, plan: BackportPlan):
-        # Refuse symlinks rather than following them into an unrelated file.
         path = Path(os.path.abspath(Path(filename).expanduser()))
         if path.is_symlink() or not path.is_file():
             raise KBError(f"worksheet must be an existing regular file: {path}")
@@ -1620,6 +1535,35 @@ class BackportWorksheet:
         self.path = path
         self.plan = plan
         self._read_validated()
+
+    @classmethod
+    def _worksheet_bounds(cls, lines: list[str]) -> tuple[int, int]:
+        """Bound the executable entries to the actual worksheet section.
+
+        Other report sections may contain commit-like headings. Those entries
+        are informational and must not affect validation or journal rendering.
+        """
+        contents = [line.rstrip("\r\n") for line in lines]
+        headings = [i for i, content in enumerate(contents)
+                    if content == cls.WORKSHEET_HEADING]
+        if len(headings) != 1:
+            raise KBError("worksheet must have exactly one BACKPORT WORKSHEET "
+                          "(oldest first) section")
+        heading = headings[0]
+        if (heading + 1 >= len(contents)
+                or not re.fullmatch(r"={40,}", contents[heading + 1])):
+            raise KBError("BACKPORT WORKSHEET section is missing its separator")
+        start = heading + 2
+        end = len(contents)
+        for i in range(start, len(contents) - 1):
+            # The planner separates major report sections with an unindented
+            # title followed by a horizontal rule. Do not guess based on
+            # commit-like text or the number of planned commits.
+            if (contents[i] and not contents[i][0].isspace()
+                    and re.fullmatch(r"={40,}", contents[i + 1])):
+                end = i
+                break
+        return start, end
 
     def _read_validated(self) -> tuple[bytes, list[str]]:
         if self.path.is_symlink() or not self.path.is_file():
@@ -1630,24 +1574,42 @@ class BackportWorksheet:
         except (OSError, UnicodeError) as exc:
             raise KBError(f"cannot read worksheet {self.path}: {exc}") from exc
         lines = text.splitlines(keepends=True)
-        matches = [self.HEADER_RE.fullmatch(line.rstrip("\r\n"))
-                   for line in lines]
-        found = [match for match in matches if match]
-        actual = [match.group("prefix")[:12] for match in found]
+        start, end = self._worksheet_bounds(lines)
+        found: list[tuple[int, re.Match[str]]] = []
+        advisors: dict[str, str] = {}
+        current: str | None = None
+        for i in range(start, end):
+            content = lines[i].rstrip("\r\n")
+            header = self.HEADER_RE.fullmatch(content)
+            if header:
+                sha = header.group("sha")
+                found.append((i, header))
+                current = sha
+                continue
+            if current is not None:
+                advisor = self.ADVISOR_RE.fullmatch(content)
+                if advisor:
+                    if current in advisors:
+                        raise KBError(f"duplicate advisor field for {current}")
+                    advisors[current] = advisor.group(1)
+                elif content and not content.startswith(" "):
+                    current = None
+        actual = [match.group("sha") for _, match in found]
         expected = [sha[:12] for sha in self.plan.order]
         if actual != expected:
             raise KBError(
-                f"worksheet entries do not match plan JSON order "
+                "worksheet entries do not match plan JSON order "
                 f"({len(actual)} worksheet entries versus "
                 f"{len(expected)} ordered commits): {self.path}"
             )
-        for match, sha in zip(found, self.plan.order):
-            original = self.plan.commits[sha]["advisor_decision"].capitalize()
-            # A live worksheet can already have machine-generated status.
-            status = match.group("status")
-            if status in ("Take", "Skip", "Review") and status != original:
-                raise KBError(f"worksheet decision for {sha[:12]} contradicts "
-                              "the immutable plan JSON; use engineer-decision")
+        for sha in self.plan.order:
+            observed = advisors.get(sha[:12])
+            expected_decision = self.plan.commits[sha]["advisor_decision"]
+            if observed != expected_decision:
+                raise KBError(
+                    f"worksheet advisor for {sha[:12]} is {observed!r}, "
+                    f"but immutable plan specifies {expected_decision!r}"
+                )
         return raw, lines
 
     def engineer_decisions(self) -> dict[str, dict[str, str]]:
@@ -1658,7 +1620,8 @@ class BackportWorksheet:
         index = 0
         inside_annotations = False
         rationale_by_sha: dict[str, str] = {}
-        for line in lines:
+        start, end = self._worksheet_bounds(lines)
+        for line in lines[start:end]:
             content = line.rstrip("\r\n")
             header = self.HEADER_RE.fullmatch(content)
             if header:
@@ -1713,60 +1676,71 @@ class BackportWorksheet:
             break_long_words=True, break_on_hyphens=False,
         )
 
-    def render(self, journal: dict, lines: list[str]) -> str:
-        entries = {entry["sha"]: entry for entry in journal["entries"]}
-        blocked = journal.get("blocked")
-        out = []
-        cursor = 0
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            match = self.HEADER_RE.fullmatch(line.rstrip("\r\n"))
-            if not match:
-                # Engineer annotations may be inserted before an existing
-                # blocker note. Remove stale machine-owned notes anywhere in
-                # the commit section, not just immediately below its header.
-                if not self.MANAGED_RE.match(line.rstrip("\r\n")):
-                    out.append(line)
-                i += 1
-                continue
-            sha = self.plan.order[cursor]
-            cursor += 1
-            entry = entries.get(sha)
-            status = self.plan.commits[sha]["advisor_decision"].capitalize()
-            if entry and entry["status"] in ("APPLIED", "APPLIED_MANUALLY"):
+    @classmethod
+    def _execution_lines(cls, sha: str, entries: dict[str, dict],
+                         blocked: dict | None) -> list[str]:
+        entry = entries.get(sha)
+        if entry:
+            status = entry["status"]
+            output = [f"      backporter-status: {status}"]
+            if status in ("APPLIED", "APPLIED_MANUALLY"):
                 downstream = entry.get("downstream_sha")
                 if not isinstance(downstream, str) or not SHA40_RE.fullmatch(downstream):
                     raise KBError(f"journal missing downstream SHA for {sha}")
-                status = "Done " + downstream[:12]
-            elif entry and entry["status"] == "ALREADY_PRESENT":
-                status = "Done (already present)"
-            elif entry and entry["status"] == "SKIPPED_ENGINEER":
-                status = "Skip (engineer)"
-            elif blocked and blocked.get("sha") == sha:
-                reason = str(blocked.get("reason", ""))
-                status = PlanTextProgress._review_reason(reason)
-            # Preserve existing newline style and all unrelated text.
-            newline = "\r\n" if line.endswith("\r\n") else (
-                "\n" if line.endswith("\n") else "")
-            out.append(match.group("prefix") + "// " + status + newline)
-            i += 1
-            # Remove only contiguous machine-owned lines, including wrapped
-            # continuations from the previous invocation.
-            while (i < len(lines)
-                   and self.MANAGED_RE.match(lines[i].rstrip("\r\n"))):
-                i += 1
-            for note in self._blocked_lines(blocked, sha):
-                out.append(note + (newline or "\n"))
+                output.append(f"      downstream-commit: {downstream}")
+            return output
+        if blocked and blocked.get("sha") == sha:
+            return (["      backporter-status: BLOCKED"] +
+                    cls._blocked_lines(blocked, sha))
+        return []
+
+    def render(self, journal: dict, lines: list[str]) -> str:
+        """Replace only machine-owned fields; retain all engineer and advisor text."""
+        entries = {entry["sha"]: entry for entry in journal["entries"]}
+        blocked = journal.get("blocked")
+        out: list[str] = []
+        sha_by_prefix = {sha[:12]: sha for sha in self.plan.order}
+        current: str | None = None
+        newline = "\n"
+
+        def finish_section() -> None:
+            nonlocal current
+            if current is not None:
+                out.extend(value + newline for value in
+                           self._execution_lines(current, entries, blocked))
+                current = None
+
+        start, end = self._worksheet_bounds(lines)
+        for i, line in enumerate(lines):
+            content = line.rstrip("\r\n")
+            if i < start or i >= end:
+                finish_section()
+                # Retire the obsolete marker on a write, without requiring it
+                # on input or touching any informational report sections.
+                if i < start and content == self.OBSOLETE_FORMAT_LINE:
+                    continue
+                out.append(line)
+                continue
+            header = self.HEADER_RE.fullmatch(content)
+            if header:
+                finish_section()
+                # Header SHAs were validated against the immutable JSON plan.
+                current = sha_by_prefix[header.group("sha")]
+                newline = "\r\n" if line.endswith("\r\n") else "\n"
+                out.append(line if line.endswith("\n") else line + newline)
+                continue
+            if current is not None:
+                if self.MANAGED_RE.match(content):
+                    continue
+                if not content or not content.startswith(" "):
+                    finish_section()
+            out.append(line)
+        finish_section()
         return "".join(out)
 
     def synchronize(self, journal: dict,
                     expected_decisions: dict[str, dict[str, str]] | None = None) -> bool:
-        """Atomically publish validated status changes; preserve manual edits.
-
-        If the engineer changes the worksheet during preparation, refuse to
-        overwrite the concurrent edit. The next invocation will resync.
-        """
+        """Atomically update managed fields, rejecting concurrent user edits."""
         import hashlib
         import stat
 
@@ -1844,8 +1818,6 @@ class PlannedBackporter(KernelBackporter):
                         and previous.get("repo") == str(self.repo)):
                     self.journal_path = legacy
         self.journal: dict = {}
-        self.text_progress: PlanTextProgress | None = None
-        self.progress_output: Path | None = None
         self.worksheet: BackportWorksheet | None = None
         self.engineer_decisions: dict[str, dict[str, str]] = {}
         self.work_index: ProvenanceIndex
@@ -2120,30 +2092,6 @@ class PlannedBackporter(KernelBackporter):
         if self.args.worksheet:
             self.worksheet = BackportWorksheet(self.args.worksheet, self.batch_plan)
             self.engineer_decisions = self.worksheet.engineer_decisions()
-        # Legacy progress snapshots remain opt-in for explicit --plan users.
-        # The new worksheet mode updates one live document in place.
-        if self.worksheet is not None and self.args.progress_output:
-            raise KBError("--worksheet and --progress-output are mutually exclusive")
-        if self.args.progress_output:
-            # Avoid resolving the final path component so dangling symlinks
-            # cannot bypass the existence check and redirect the output.
-            destination = Path(os.path.abspath(
-                Path(self.args.progress_output).expanduser()))
-            candidate = (Path(self.args.text_plan).expanduser().resolve()
-                         if self.args.text_plan
-                         else self.batch_plan.path.with_suffix(".c"))
-            if not candidate.is_file():
-                raise KBError(f"planner text report not found: {candidate}")
-            if (os.path.lexists(destination) or
-                    destination in (candidate, self.batch_plan.path,
-                                    self.journal_path)):
-                raise KBError(f"progress output already exists or names an input: {destination}")
-            if not destination.parent.is_dir():
-                raise KBError(f"progress output directory does not exist: {destination.parent}")
-            self.text_progress = PlanTextProgress(candidate, self.batch_plan)
-            self.progress_output = destination
-        elif self.args.text_plan:
-            raise KBError("--text-plan requires --progress-output")
         if not self.work_git.status_clean():
             raise KBError("working tree/index is not clean; resolve or commit changes first")
         if self.args.check_command:
@@ -2442,11 +2390,6 @@ class PlannedBackporter(KernelBackporter):
             return 0
         finally:
             shutil.rmtree(root, ignore_errors=True)
-            if not self.args.dry_run and self.text_progress is not None:
-                # Use the original text and journal, including blocked status.
-                snapshot = self.text_progress.write_to(
-                    self.progress_output, self.batch_plan, self.journal)
-                print(f"Text plan progress: {snapshot}")
 
     def _plan_conflict_dossier(self, sha: str, reason: str, files: list[str]) -> Path:
         """Save a self-contained manual inspection packet without editing source."""
@@ -2535,8 +2478,6 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--journal", help="override plan execution journal location")
     p.add_argument("--worksheet", help="editable worksheet for an explicit --plan "
                    "(updated in place; engineer-decision TAKE/SKIP overrides)")
-    p.add_argument("--text-plan", help="legacy source for --progress-output snapshots")
-    p.add_argument("--progress-output", help="user-chosen progress filename; never overwrite")
     p.add_argument(
         "--repo",
         help="downstream working repository (default: "
@@ -2619,24 +2560,15 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     if args.status:
         if not args.plan:
             p.error("--status requires --plan")
-        if (args.dry_run or args.progress_output
-                or args.text_plan or args.check_command
+        if (args.dry_run or args.check_command
                 or args.max_attempts != 1):
             p.error("--status is read-only; cannot combine with "
-                    "--dry-run, --progress-output, --text-plan, "
-                    "--check-command, or --max-attempts")
+                    "--dry-run, --check-command, or --max-attempts")
     if args.max_attempts < 1:
         p.error("--max-attempts must be at least 1")
-    if not args.plan and (args.journal or args.text_plan or
-                          args.progress_output or args.worksheet or
+    if not args.plan and (args.journal or args.worksheet or
                           args.max_attempts != 1):
         p.error("plan execution flags require --plan or --results-dir")
-    if args.worksheet and args.progress_output:
-        p.error("--worksheet cannot be combined with --progress-output")
-    if args.text_plan and not args.progress_output:
-        p.error("--text-plan requires --progress-output")
-    if args.dry_run and args.progress_output:
-        p.error("--progress-output is not available with --dry-run")
     return args
 
 
